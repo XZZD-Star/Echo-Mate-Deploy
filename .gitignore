@@ -12,3 +12,4 @@ __pycache__/
 *.pre-*
 patch_*.py
 .env
+shared/__pycache__/

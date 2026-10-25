@@ -17,6 +17,7 @@ import lark_oapi as lark
 from dotenv import load_dotenv, dotenv_values
 from urllib.parse import urlparse
 from openai import OpenAI
+from echomate_credentials import credential
 
 # 主动播报队列：与 AIChat Server 共用同一份 SQLite，纯标准库实现。
 sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
@@ -28,11 +29,11 @@ from tools import notify_store
 os.umask(0o077)
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env", override=False)
 
-APP_ID = (os.getenv("LARK_APP_ID") or "").strip()
-APP_SECRET = (os.getenv("LARK_APP_SECRET") or "").strip()
-OWNER_OPEN_ID = (os.getenv("LARK_OWNER_OPEN_ID") or "").strip()
+APP_ID = credential("lark_app_id")
+APP_SECRET = credential("lark_app_secret")
+OWNER_OPEN_ID = credential("lark_owner_open_id")
 
 DB_PATH = Path("/var/lib/echomate/assistant.db")
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -1196,16 +1197,15 @@ api_client = (
 
 # ==================== Qwen 普通聊天 ====================
 
-SERVER_ENV = Path(
-    "/root/echomate-deploy/app/Demo/AIChat_demo/Server/.env"
+server_cfg = dotenv_values(
+    Path("/root/echomate-deploy/app/Demo/AIChat_demo/Server/.env")
 )
-server_cfg = dotenv_values(SERVER_ENV)
 
-QWEN_API_KEY = (server_cfg.get("DASHSCOPE_API_KEY") or "").strip()
+QWEN_API_KEY = credential("dashscope_api_key")
 QWEN_MODEL = (server_cfg.get("CHAT_MODEL") or "qwen-max").strip()
 
-# 联网搜索：Key 只放 feishu_bot/.env，不进仓库。
-TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
+# 联网搜索凭据由 systemd 单独注入，不进仓库。
+TAVILY_API_KEY = credential("tavily_api_key")
 TAVILY_URL = "https://api.tavily.com/search"
 SEARCH_CACHE_TTL = 600
 _search_cache = {}

@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import os
 import json
 import sys
+from echomate_credentials import credential
 
 # 主动播报队列：与 AIChat Server 共用同一份 SQLite。
 sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
@@ -23,11 +24,11 @@ from tools import notify_store
 os.umask(0o077)
 
 BOT_DIR = Path("/root/echomate-deploy/feishu_bot")
-load_dotenv(BOT_DIR / ".env")
+load_dotenv(BOT_DIR / ".env", override=False)
 
-APP_ID = (os.getenv("LARK_APP_ID") or "").strip()
-APP_SECRET = (os.getenv("LARK_APP_SECRET") or "").strip()
-OWNER_OPEN_ID = (os.getenv("LARK_OWNER_OPEN_ID") or "").strip()
+APP_ID = credential("lark_app_id")
+APP_SECRET = credential("lark_app_secret")
+OWNER_OPEN_ID = credential("lark_owner_open_id")
 
 DB_PATH = Path("/var/lib/echomate/assistant.db")
 

@@ -491,6 +491,11 @@ def send_startup_report_once():
     if down:
         report += "\n掉线：" + "、".join(down)
 
+    report += "\n\n0 回菜单"
+
+    if down:
+        report += "\n掉线：" + "、".join(down)
+
     # 发送失败时不写入 Boot ID，下个检查周期会重试。
     if not send_feishu(report):
         return
@@ -535,13 +540,13 @@ def send_startup_menu_once():
         return
 
     menu = (
-        "Echo\n\n"
-        "1 · 状态\n"
-        "2 · 待办\n"
-        "3 · 新待办\n"
-        "4 · 记忆\n"
-        "5 · 帮助\n"
-        "6 · 播报"
+        "🐣 Echo\n\n"
+        "1 · 📊 状态\n"
+        "2 · 📋 待办\n"
+        "3 · ➕ 新待办\n"
+        "4 · 📚 记忆\n"
+        "5 · 💡 帮助\n"
+        "6 · 🔊 播报"
     )
 
     if not send_feishu(menu):

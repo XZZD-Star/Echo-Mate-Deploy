@@ -20,13 +20,13 @@ SERVICES = [
 ]
 
 MENU = (
-    "Echo\n\n"
-    "1 · 状态\n"
-    "2 · 待办\n"
-    "3 · 新待办\n"
-    "4 · 记忆\n"
-    "5 · 帮助\n"
-    "6 · 播报"
+    "🐣 Echo\n\n"
+    "1 · 📊 状态\n"
+    "2 · 📋 待办\n"
+    "3 · ➕ 新待办\n"
+    "4 · 📚 记忆\n"
+    "5 · 💡 帮助\n"
+    "6 · 🔊 播报"
 )
 
 
@@ -144,6 +144,7 @@ def make_connect_message():
     if down:
         report += "\n掉线：" + "、".join(down)
 
+    report += "\n\n0 回菜单"
     return report
 
 

@@ -1,0 +1,865 @@
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import psutil
+import threading
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import lark_oapi as lark
+from dotenv import load_dotenv, dotenv_values
+from urllib.parse import urlparse
+from openai import OpenAI
+
+
+# ==================== 配置 ====================
+
+os.umask(0o077)
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+APP_ID = (os.getenv("LARK_APP_ID") or "").strip()
+APP_SECRET = (os.getenv("LARK_APP_SECRET") or "").strip()
+OWNER_OPEN_ID = (os.getenv("LARK_OWNER_OPEN_ID") or "").strip()
+
+DB_PATH = Path("/var/lib/echomate/assistant.db")
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+if not APP_ID or not APP_SECRET:
+    raise SystemExit("错误：App ID 或 App Secret 未配置")
+
+if not OWNER_OPEN_ID.startswith("ou_"):
+    raise SystemExit("错误：LARK_OWNER_OPEN_ID 未正确配置")
+
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+os.chmod(DB_PATH.parent, 0o700)
+
+
+def now_utc():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def format_due(utc_text):
+    dt = datetime.fromisoformat(utc_text).astimezone(LOCAL_TZ)
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+# ==================== 数据库 ====================
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memories_owner_id
+                ON memories(owner_id, id);
+
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY,
+                processed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                due_at_utc TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at_utc TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                reminded_at_utc TEXT,
+                last_attempt_at_utc TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_todos_due
+                ON todos(status, due_at_utc, reminded_at_utc);
+        """)
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat(timespec="seconds")
+
+        conn.execute(
+            "DELETE FROM processed_events WHERE processed_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if DB_PATH.exists():
+        os.chmod(DB_PATH, 0o600)
+
+
+# ==================== 记忆与待办命令 ====================
+
+def init_chat_table():
+    """建立独立聊天历史表，不修改已有记忆和待办数据。"""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL
+                    CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_lookup
+                ON chat_messages(owner_id, chat_id, id);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    os.chmod(DB_PATH, 0o600)
+
+
+def help_text():
+    return (
+        "你好，我是 Echo-Mate Personal Assistant。\n\n"
+        "【记忆管理】\n"
+        "记住：Echo-Mate 已完成 VPS 部署\n"
+        "查记忆：VPS 部署\n"
+        "列出记忆\n"
+        "删除记忆 1\n\n"
+        "【待办管理】\n"
+        "添加待办 2026-10-18 15:00 检查 VPS\n"
+        "我的待办\n"
+        "完成待办 1\n"
+        "取消待办 1\n\n"
+        "待办时间采用北京时间（Asia/Shanghai）。\n"
+        "到期后机器人会通过飞书发送提醒。"
+    )
+
+
+
+def vps_status_text():
+    """采集 VPS 实时资源与关键服务状态。"""
+    cpu = psutil.cpu_percent(interval=0.3)
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    disk = psutil.disk_usage("/")
+
+    current = datetime.now(LOCAL_TZ)
+    boot = datetime.fromtimestamp(
+        psutil.boot_time(), tz=timezone.utc
+    ).astimezone(LOCAL_TZ)
+
+    uptime = timedelta(
+        seconds=max(0, int(time.time() - psutil.boot_time()))
+    )
+    uptime_text = (
+        f"{uptime.days}天"
+        f"{uptime.seconds // 3600}小时"
+        f"{(uptime.seconds % 3600) // 60}分钟"
+    )
+
+    services = [
+        ("echomate-server.service", "Echo-Mate Server"),
+        ("echomate-feishu-bot.service", "飞书机器人"),
+        ("echomate-monitor.service", "VPS 监控"),
+    ]
+
+    lines = [
+        "🖥 VPS 实时状态报告",
+        f"主机：{os.uname().nodename}",
+        f"报告时间（北京时间）：{current:%Y-%m-%d %H:%M:%S}",
+        f"系统最近启动：{boot:%Y-%m-%d %H:%M:%S}",
+        f"运行时间：{uptime_text}",
+        "",
+        f"CPU：{cpu:.1f}%（{psutil.cpu_count()} 个逻辑核）",
+        (
+            f"内存：总计 {mem.total / 1024**3:.2f} GiB，"
+            f"可用 {mem.available / 1024**3:.2f} GiB，"
+            f"使用率 {mem.percent:.1f}%"
+        ),
+        (
+            f"Swap：已使用 {swap.used / 1024**3:.2f} / "
+            f"{swap.total / 1024**3:.2f} GiB"
+        ),
+        (
+            f"磁盘 /：剩余 {disk.free / 1024**3:.2f} / "
+            f"{disk.total / 1024**3:.2f} GiB，"
+            f"使用率 {disk.percent:.1f}%"
+        ),
+        "",
+        "关键服务状态：",
+    ]
+
+    for unit, label in services:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", unit],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            state = result.stdout.strip() or "unknown"
+        except (OSError, subprocess.TimeoutExpired):
+            state = "检查失败"
+
+        lines.append(f"{label}：{state}")
+
+    return "\n".join(lines)
+
+
+def handle_command(conn, text, chat_id):
+    text = text.strip()
+
+    if text in {"检查 VPS", "检查VPS", "VPS 状态", "VPS状态", "服务器状态"}:
+        return vps_status_text()
+
+    if text in {"帮助", "菜单", "功能"}:
+        return help_text()
+
+    # -------- 创建待办 --------
+
+    match = re.match(
+        r"^添加待办\s+(\d{4}-\d{2}-\d{2})\s+"
+        r"(\d{2}:\d{2})\s+(.+)$",
+        text,
+        re.DOTALL,
+    )
+
+    if match:
+        date_text, time_text, title = match.groups()
+        title = title.strip()
+
+        if not title:
+            return "待办标题不能为空。"
+
+        if len(title) > 200:
+            return "待办标题最多 200 个字符。"
+
+        try:
+            due_local = datetime.strptime(
+                f"{date_text} {time_text}",
+                "%Y-%m-%d %H:%M",
+            ).replace(tzinfo=LOCAL_TZ)
+        except ValueError:
+            return (
+                "日期或时间格式不正确。\n"
+                "正确示例：添加待办 2026-10-18 15:00 检查 VPS"
+            )
+
+        if due_local <= datetime.now(LOCAL_TZ):
+            return "截止时间必须晚于当前时间，请重新设置。"
+
+        due_utc = due_local.astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO todos
+                (owner_id, title, due_at_utc, timezone,
+                 status, created_at_utc, chat_id)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                OWNER_OPEN_ID,
+                title,
+                due_utc,
+                "Asia/Shanghai",
+                now_utc(),
+                chat_id,
+            ),
+        )
+
+        return (
+            f"✅ 待办创建成功，编号 #{cursor.lastrowid}\n"
+            f"事项：{title}\n"
+            f"时间：{due_local.strftime('%Y-%m-%d %H:%M')}\n"
+            "到期后将通过飞书提醒你。"
+        )
+
+    # -------- 查询待办 --------
+
+    if text in {"我的待办", "待办列表", "查看待办"}:
+        rows = conn.execute(
+            """
+            SELECT id, title, due_at_utc
+            FROM todos
+            WHERE owner_id = ? AND status = 'pending'
+            ORDER BY due_at_utc ASC
+            LIMIT 20
+            """,
+            (OWNER_OPEN_ID,),
+        ).fetchall()
+
+        if not rows:
+            return "目前没有未完成的待办。"
+
+        lines = ["📋 未完成的待办（最多显示 20 条）："]
+
+        for todo_id, title, due_utc in rows:
+            lines.append(
+                f"\n#{todo_id}｜{format_due(due_utc)}｜{title}"
+            )
+
+        return "\n".join(lines)
+
+    # -------- 完成或取消待办 --------
+
+    match = re.match(
+        r"^(完成待办|取消待办)\s*[:：#]?\s*(\d+)\s*$",
+        text,
+    )
+
+    if match:
+        action, todo_id_text = match.groups()
+        todo_id = int(todo_id_text)
+
+        new_status = "completed" if action == "完成待办" else "cancelled"
+
+        cursor = conn.execute(
+            """
+            UPDATE todos
+            SET status = ?
+            WHERE id = ? AND owner_id = ? AND status = 'pending'
+            """,
+            (new_status, todo_id, OWNER_OPEN_ID),
+        )
+
+        if cursor.rowcount:
+            if action == "完成待办":
+                return f"✅ 待办 #{todo_id} 已标记为完成。"
+            return f"✅ 待办 #{todo_id} 已取消。"
+
+        return (
+            f"没有找到编号为 #{todo_id} 的未完成待办。"
+            "它可能不存在，或已经完成、取消。"
+        )
+
+    # -------- 保存记忆 --------
+
+    match = re.match(
+        r"^(?:记住|保存记忆)\s*[:：]\s*(.+)$",
+        text,
+        re.DOTALL,
+    )
+
+    if match:
+        content = match.group(1).strip()
+
+        if not content:
+            return "记忆内容不能为空。"
+
+        if len(content) > 2000:
+            return "单条记忆最多 2000 个字符，请缩短后重试。"
+
+        cursor = conn.execute(
+            """
+            INSERT INTO memories (owner_id, content, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (OWNER_OPEN_ID, content, now_utc()),
+        )
+
+        return (
+            f"✅ 记忆已保存，编号 #{cursor.lastrowid}。\n"
+            f"内容：{content[:150]}"
+        )
+
+    # -------- 搜索记忆 --------
+
+    match = re.match(
+        r"^(?:查记忆|搜索记忆)\s*[:：]?\s*(.+)$",
+        text,
+        re.DOTALL,
+    )
+
+    if match:
+        keyword = match.group(1).strip()
+
+        rows = conn.execute(
+            """
+            SELECT id, content
+            FROM memories
+            WHERE owner_id = ? AND content LIKE ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (OWNER_OPEN_ID, f"%{keyword}%"),
+        ).fetchall()
+
+        if not rows:
+            return f"没有找到包含“{keyword}”的记忆。"
+
+        lines = [f"🔎 找到 {len(rows)} 条相关记忆："]
+        lines.extend(
+            f"\n#{row[0]}：{row[1][:180]}"
+            for row in rows
+        )
+        return "\n".join(lines)
+
+    # -------- 列出记忆 --------
+
+    if text in {"列出记忆", "我的记忆", "记忆列表"}:
+        rows = conn.execute(
+            """
+            SELECT id, content
+            FROM memories
+            WHERE owner_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (OWNER_OPEN_ID,),
+        ).fetchall()
+
+        if not rows:
+            return "目前还没有保存任何记忆。"
+
+        lines = ["📚 最近的记忆（最多 10 条）："]
+        lines.extend(
+            f"\n#{row[0]}：{row[1][:180]}"
+            for row in rows
+        )
+        return "\n".join(lines)
+
+    # -------- 删除记忆 --------
+
+    match = re.match(
+        r"^删除记忆\s*[:：#]?\s*(\d+)\s*$",
+        text,
+    )
+
+    if match:
+        memory_id = int(match.group(1))
+
+        cursor = conn.execute(
+            """
+            DELETE FROM memories
+            WHERE id = ? AND owner_id = ?
+            """,
+            (memory_id, OWNER_OPEN_ID),
+        )
+
+        if cursor.rowcount:
+            return f"✅ 记忆 #{memory_id} 已删除。"
+
+        return f"没有找到编号为 #{memory_id} 的记忆。"
+
+    return None
+
+
+# ==================== 飞书消息发送 ====================
+
+api_client = (
+    lark.Client.builder()
+    .app_id(APP_ID)
+    .app_secret(APP_SECRET)
+    .build()
+)
+
+
+
+# ==================== Qwen 普通聊天 ====================
+
+SERVER_ENV = Path(
+    "/root/echomate-deploy/app/Demo/AIChat_demo/Server/.env"
+)
+server_cfg = dotenv_values(SERVER_ENV)
+
+QWEN_API_KEY = (server_cfg.get("DASHSCOPE_API_KEY") or "").strip()
+QWEN_MODEL = (server_cfg.get("CHAT_MODEL") or "qwen-max").strip()
+
+# 沿用此前独立 API 测试成功的地域/Workspace 端点选择方式。
+ws_endpoint = (
+    server_cfg.get("DASHSCOPE_BASE_WEBSOCKET_API_URL") or ""
+).strip()
+ws_host = urlparse(ws_endpoint).hostname
+
+if ws_host and ws_host.endswith(".maas.aliyuncs.com"):
+    QWEN_BASE_URL = f"https://{ws_host}/compatible-mode/v1"
+else:
+    QWEN_BASE_URL = (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+
+qwen_client = None
+if QWEN_API_KEY:
+    qwen_client = OpenAI(
+        api_key=QWEN_API_KEY,
+        base_url=QWEN_BASE_URL,
+        timeout=35.0,
+        max_retries=0,
+    )
+
+
+def generate_ai_reply(chat_id, user_text):
+    """使用 Qwen 回复普通聊天，并保存近期上下文。"""
+    if qwen_client is None:
+        return "AI 服务尚未配置，请检查服务端的百炼 API 配置。"
+
+    if len(user_text) > 4000:
+        return "这条消息有些长，请控制在 4000 个字符以内。"
+
+    # 先读取历史，再关闭数据库连接，避免网络请求期间占用数据库。
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        rows = conn.execute(
+            """
+            SELECT role, content
+            FROM chat_messages
+            WHERE owner_id = ? AND chat_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (OWNER_OPEN_ID, chat_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    history = [
+        {"role": role, "content": content}
+        for role, content in reversed(rows)
+    ]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Echo-Mate Personal Assistant，"
+                "请使用简体中文回答，表达自然、清晰、简洁。"
+                "你不能直接执行服务器命令，也不能声称已经完成"
+                "实际未执行的操作。"
+                "管理记忆请提示用户使用“记住：内容”；"
+                "管理待办请提示用户使用机器人支持的待办命令。"
+            ),
+        },
+        *history,
+        {"role": "user", "content": user_text},
+    ]
+
+    try:
+        response = qwen_client.chat.completions.create(
+            model=QWEN_MODEL,
+            messages=messages,
+            max_tokens=700,
+        )
+
+        reply = response.choices[0].message.content
+        if not isinstance(reply, str) or not reply.strip():
+            return "AI 暂时没有生成有效回复，请换个方式提问。"
+
+        reply = reply.strip()
+
+    except Exception as exc:
+        # 避免将请求内容或凭证写入日志。
+        print(
+            f"[Qwen] 请求失败，异常类型={type(exc).__name__}",
+            flush=True,
+        )
+        return "抱歉，AI 服务暂时没有成功响应，请稍后再试。"
+
+    # 只有成功获得回答后才保存本轮聊天。
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO chat_messages
+                    (owner_id, chat_id, role, content, created_at_utc)
+                VALUES (?, ?, 'user', ?, ?)
+                """,
+                (OWNER_OPEN_ID, chat_id, user_text, now_utc()),
+            )
+            conn.execute(
+                """
+                INSERT INTO chat_messages
+                    (owner_id, chat_id, role, content, created_at_utc)
+                VALUES (?, ?, 'assistant', ?, ?)
+                """,
+                (OWNER_OPEN_ID, chat_id, reply, now_utc()),
+            )
+
+            # 每个聊天只保留最近 12 条消息。
+            conn.execute(
+                """
+                DELETE FROM chat_messages
+                WHERE owner_id = ? AND chat_id = ?
+                  AND id NOT IN (
+                    SELECT id
+                    FROM chat_messages
+                    WHERE owner_id = ? AND chat_id = ?
+                    ORDER BY id DESC
+                    LIMIT 12
+                  )
+                """,
+                (
+                    OWNER_OPEN_ID, chat_id,
+                    OWNER_OPEN_ID, chat_id,
+                ),
+            )
+    finally:
+        conn.close()
+
+    print("[Qwen] 普通聊天回复成功", flush=True)
+    return reply
+
+
+def send_text(receive_id, text, receive_id_type="chat_id"):
+    request = (
+        lark.im.v1.CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(
+            lark.im.v1.CreateMessageRequestBody.builder()
+            .receive_id(receive_id)
+            .msg_type("text")
+            .content(json.dumps({"text": text}, ensure_ascii=False))
+            .build()
+        )
+        .build()
+    )
+
+    response = api_client.im.v1.message.create(request)
+
+    if response.success():
+        print("[飞书] 消息发送成功", flush=True)
+        return True
+
+    print(
+        f"[飞书] 消息发送失败：code={response.code}, "
+        f"msg={response.msg}, log_id={response.get_log_id()}",
+        flush=True,
+    )
+    return False
+
+
+# ==================== 到期提醒线程 ====================
+
+def reminder_loop():
+    print("[待办] 到期提醒调度器已启动，检查间隔 15 秒", flush=True)
+
+    while True:
+        try:
+            current_time = now_utc()
+            retry_before = (
+                datetime.now(timezone.utc) - timedelta(seconds=60)
+            ).isoformat(timespec="seconds")
+
+            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, title, due_at_utc, chat_id
+                    FROM todos
+                    WHERE status = 'pending'
+                      AND reminded_at_utc IS NULL
+                      AND due_at_utc <= ?
+                      AND (
+                        last_attempt_at_utc IS NULL
+                        OR last_attempt_at_utc <= ?
+                      )
+                    ORDER BY due_at_utc
+                    LIMIT 20
+                    """,
+                    (current_time, retry_before),
+                ).fetchall()
+
+            for todo_id, title, due_utc, chat_id in rows:
+                attempt_time = now_utc()
+
+                # 先记录尝试时间，避免发送失败时每 15 秒刷屏。
+                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                    cursor = conn.execute(
+                        """
+                        UPDATE todos
+                        SET last_attempt_at_utc = ?
+                        WHERE id = ?
+                          AND status = 'pending'
+                          AND reminded_at_utc IS NULL
+                          AND (
+                            last_attempt_at_utc IS NULL
+                            OR last_attempt_at_utc <= ?
+                          )
+                        """,
+                        (attempt_time, todo_id, retry_before),
+                    )
+
+                if cursor.rowcount == 0:
+                    continue
+
+                due_display = format_due(due_utc)
+                content = (
+                    f"⏰ 待办到期提醒\n"
+                    f"编号：#{todo_id}\n"
+                    f"事项：{title}\n"
+                    f"计划时间：{due_display}\n\n"
+                    f"完成后发送：完成待办 {todo_id}\n"
+                    f"取消任务发送：取消待办 {todo_id}"
+                )
+
+                try:
+                    sent = send_text(chat_id, content)
+                except Exception as exc:
+                    print(
+                        f"[待办] #{todo_id} 发送异常：{type(exc).__name__}",
+                        flush=True,
+                    )
+                    sent = False
+
+                if sent:
+                    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                        conn.execute(
+                            """
+                            UPDATE todos
+                            SET reminded_at_utc = ?
+                            WHERE id = ?
+                              AND status = 'pending'
+                              AND reminded_at_utc IS NULL
+                            """,
+                            (now_utc(), todo_id),
+                        )
+                else:
+                    print(
+                        f"[待办] #{todo_id} 提醒发送失败，稍后重试",
+                        flush=True,
+                    )
+
+        except Exception as exc:
+            print(
+                f"[待办] 调度器异常：{type(exc).__name__}",
+                flush=True,
+            )
+
+        time.sleep(15)
+
+
+# ==================== 飞书事件处理 ====================
+
+def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
+    header = getattr(data, "header", None)
+    event = getattr(data, "event", None)
+
+    if event is None:
+        return
+
+    message = getattr(event, "message", None)
+    sender = getattr(event, "sender", None)
+
+    if message is None or sender is None:
+        return
+
+    # 私人记忆和待办仅在单聊中处理。
+    if getattr(message, "chat_type", "") != "p2p":
+        return
+
+    if getattr(sender, "sender_type", "") != "user":
+        return
+
+    sender_id = getattr(sender, "sender_id", None)
+    open_id = getattr(sender_id, "open_id", "")
+
+    if open_id != OWNER_OPEN_ID:
+        print("[安全] 已忽略非授权用户消息", flush=True)
+        return
+
+    if getattr(message, "message_type", "") != "text":
+        return
+
+    try:
+        payload = json.loads(message.content or "{}")
+        user_text = str(payload.get("text", "")).strip()
+    except (json.JSONDecodeError, TypeError):
+        return
+
+    if not user_text:
+        return
+
+    event_id = getattr(header, "event_id", None)
+    event_id = event_id or getattr(message, "message_id", None)
+
+    if not event_id:
+        print("[飞书] 事件缺少唯一 ID，已忽略", flush=True)
+        return
+
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    reply = None
+
+    try:
+        with conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO processed_events
+                    (event_id, processed_at)
+                VALUES (?, ?)
+                """,
+                (event_id, now_utc()),
+            )
+
+            if cursor.rowcount == 0:
+                print("[飞书] 重复事件已忽略", flush=True)
+                return
+
+            reply = handle_command(conn, user_text, message.chat_id)
+
+    except Exception as exc:
+        print(
+            f"[数据库] 处理失败：{type(exc).__name__}",
+            flush=True,
+        )
+        return
+    finally:
+        conn.close()
+
+    if reply is None:
+        reply = generate_ai_reply(message.chat_id, user_text)
+
+    if reply:
+        try:
+            send_text(message.chat_id, reply)
+        except Exception as exc:
+            print(
+                f"[飞书] 回复异常：{type(exc).__name__}",
+                flush=True,
+            )
+
+
+# ==================== 启动 ====================
+
+init_db()
+init_chat_table()
+
+threading.Thread(
+    target=reminder_loop,
+    name="todo-reminder",
+    daemon=True,
+).start()
+
+handler = (
+    lark.EventDispatcherHandler.builder("", "")
+    .register_p2_im_message_receive_v1(on_message)
+    .build()
+)
+
+client = lark.ws.Client(
+    APP_ID,
+    APP_SECRET,
+    event_handler=handler,
+)
+
+print("[记忆助手] SQLite 初始化完成", flush=True)
+print("[记忆助手] 记忆和待办仅允许授权账号私聊操作", flush=True)
+print(f"[记忆助手] 数据库位置：{DB_PATH}", flush=True)
+print("[飞书] 正在连接开放平台……", flush=True)
+
+client.start()

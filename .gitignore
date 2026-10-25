@@ -1,0 +1,14 @@
+app/
+venv/
+feishu-venv/
+backups/
+p1p3/
+*.log
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+*.before-*
+*.pre-*
+patch_*.py
+.env

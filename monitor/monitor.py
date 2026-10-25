@@ -1,0 +1,553 @@
+import argparse
+import sqlite3
+import subprocess
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import psutil
+import lark_oapi as lark
+from dotenv import load_dotenv
+import os
+import json
+
+
+# ================= 配置 =================
+
+os.umask(0o077)
+
+BOT_DIR = Path("/root/echomate-deploy/feishu_bot")
+load_dotenv(BOT_DIR / ".env")
+
+APP_ID = (os.getenv("LARK_APP_ID") or "").strip()
+APP_SECRET = (os.getenv("LARK_APP_SECRET") or "").strip()
+OWNER_OPEN_ID = (os.getenv("LARK_OWNER_OPEN_ID") or "").strip()
+
+DB_PATH = Path("/var/lib/echomate/assistant.db")
+
+CHECK_INTERVAL = 60
+DISK_INTERVAL = 300
+ALERT_COOLDOWN = 1800
+
+CPU_LIMIT = 90.0
+CPU_DURATION = 300
+MEMORY_LIMIT = 250 * 1024 * 1024
+DISK_FREE_LIMIT = 3 * 1024 * 1024 * 1024
+DISK_USAGE_LIMIT = 85.0
+
+WATCH_SERVICES = [
+    "echomate-server.service",
+    "echomate-feishu-bot.service",
+]
+
+if not APP_ID or not APP_SECRET or not OWNER_OPEN_ID:
+    raise SystemExit(
+        "监控启动失败：飞书 App ID、App Secret 或 Open ID 未配置"
+    )
+
+
+# ================= 飞书通知 =================
+
+api_client = (
+    lark.Client.builder()
+    .app_id(APP_ID)
+    .app_secret(APP_SECRET)
+    .build()
+)
+
+
+def send_feishu(text):
+    """通过飞书机器人向自己的 open_id 发送文字。"""
+    request = (
+        lark.im.v1.CreateMessageRequest.builder()
+        .receive_id_type("open_id")
+        .request_body(
+            lark.im.v1.CreateMessageRequestBody.builder()
+            .receive_id(OWNER_OPEN_ID)
+            .msg_type("text")
+            .content(json.dumps({"text": text}, ensure_ascii=False))
+            .build()
+        )
+        .build()
+    )
+
+    try:
+        response = api_client.im.v1.message.create(request)
+        if response.success():
+            print("[通知] 飞书消息发送成功", flush=True)
+            return True
+
+        print(
+            f"[通知] 发送失败：code={response.code}, "
+            f"msg={response.msg}, log_id={response.get_log_id()}",
+            flush=True,
+        )
+        return False
+    except Exception as exc:
+        print(
+            f"[通知] 发送异常：{type(exc).__name__}",
+            flush=True,
+        )
+        return False
+
+
+# ================= 持久化告警状态 =================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def now_text():
+    return now_utc().isoformat(timespec="seconds")
+
+
+def parse_time(value):
+    return datetime.fromisoformat(value)
+
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def init_db():
+    with db_connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS monitor_state (
+                alert_key TEXT PRIMARY KEY,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                bad_count INTEGER NOT NULL DEFAULT 0,
+                first_bad_at TEXT,
+                last_notified_at TEXT,
+                details TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+
+def load_state(key):
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT is_active, bad_count, first_bad_at,
+                   last_notified_at, details
+            FROM monitor_state
+            WHERE alert_key = ?
+            """,
+            (key,),
+        ).fetchone()
+
+    if not row:
+        return {
+            "active": False,
+            "count": 0,
+            "first_bad": None,
+            "last_notified": None,
+            "details": None,
+        }
+
+    return {
+        "active": bool(row[0]),
+        "count": row[1],
+        "first_bad": row[2],
+        "last_notified": row[3],
+        "details": row[4],
+    }
+
+
+def save_state(key, state, details):
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO monitor_state (
+                alert_key, is_active, bad_count, first_bad_at,
+                last_notified_at, details, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET
+                is_active=excluded.is_active,
+                bad_count=excluded.bad_count,
+                first_bad_at=excluded.first_bad_at,
+                last_notified_at=excluded.last_notified_at,
+                details=excluded.details,
+                updated_at=excluded.updated_at
+            """,
+            (
+                key,
+                int(state["active"]),
+                state["count"],
+                state["first_bad"],
+                state["last_notified"],
+                details,
+                now_text(),
+            ),
+        )
+
+
+def evaluate(key, title, abnormal, details,
+             min_count=1, min_duration=0):
+    """记录连续异常，只在达到阈值时告警，恢复后发送恢复通知。"""
+    state = load_state(key)
+    current = now_utc()
+
+    if abnormal:
+        state["count"] += 1
+
+        if state["first_bad"] is None:
+            state["first_bad"] = current.isoformat(
+                timespec="seconds"
+            )
+
+        elapsed = (
+            current - parse_time(state["first_bad"])
+        ).total_seconds()
+
+        confirmed = (
+            state["count"] >= min_count
+            and elapsed >= min_duration
+        )
+
+        if confirmed:
+            cooldown_passed = (
+                state["last_notified"] is None
+                or (
+                    current - parse_time(
+                        state["last_notified"]
+                    )
+                ).total_seconds() >= ALERT_COOLDOWN
+            )
+
+            if not state["active"] or cooldown_passed:
+                if state["active"]:
+                    heading = "⚠️ VPS 异常仍在持续"
+                else:
+                    heading = "🚨 VPS 异常告警"
+
+                message = (
+                    f"{heading}\n"
+                    f"监控项：{title}\n"
+                    f"详情：{details}\n"
+                    f"时间：{current.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+                if send_feishu(message):
+                    state["active"] = True
+                    state["last_notified"] = current.isoformat(
+                        timespec="seconds"
+                    )
+    else:
+        state["count"] = 0
+        state["first_bad"] = None
+
+        if state["active"]:
+            message = (
+                f"✅ VPS 异常已恢复\n"
+                f"监控项：{title}\n"
+                f"当前状态：{details}\n"
+                f"时间：{current.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            if send_feishu(message):
+                state["active"] = False
+                state["last_notified"] = None
+
+    save_state(key, state, details)
+
+
+# ================= 监控检查 =================
+
+def service_is_active(name):
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def check_services():
+    for service in WATCH_SERVICES:
+        active = service_is_active(service)
+
+        evaluate(
+            key=f"service:{service}",
+            title=f"服务状态：{service}",
+            abnormal=not active,
+            details=(
+                "服务运行正常"
+                if active
+                else "服务不活跃或状态检查失败"
+            ),
+        )
+
+
+def check_cpu_memory():
+    cpu = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+
+    print(
+        f"[采样] CPU={cpu:.1f}%, "
+        f"可用内存={memory.available / 1024**2:.0f} MiB, "
+        f"Swap={swap.percent:.1f}%",
+        flush=True,
+    )
+
+    evaluate(
+        key="cpu_high",
+        title="CPU 使用率过高",
+        abnormal=cpu > CPU_LIMIT,
+        details=f"CPU 使用率：{cpu:.1f}%，阈值：{CPU_LIMIT:.0f}%",
+        min_duration=CPU_DURATION,
+    )
+
+    evaluate(
+        key="memory_low",
+        title="可用内存不足",
+        abnormal=memory.available < MEMORY_LIMIT,
+        details=(
+            f"可用内存：{memory.available / 1024**2:.0f} MiB，"
+            f"阈值：{MEMORY_LIMIT / 1024**2:.0f} MiB"
+        ),
+        min_count=3,
+    )
+
+
+def check_disk():
+    disk = psutil.disk_usage("/")
+    free_gib = disk.free / 1024**3
+
+    print(
+        f"[采样] 根分区已使用={disk.percent:.1f}%, "
+        f"剩余={free_gib:.2f} GiB",
+        flush=True,
+    )
+
+    abnormal = (
+        disk.free < DISK_FREE_LIMIT
+        or disk.percent >= DISK_USAGE_LIMIT
+    )
+
+    evaluate(
+        key="disk_low",
+        title="根分区空间不足",
+        abnormal=abnormal,
+        details=(
+            f"使用率：{disk.percent:.1f}%，"
+            f"剩余空间：{free_gib:.2f} GiB；"
+            f"阈值：剩余低于 3 GiB 或使用率达到 85%"
+        ),
+    )
+
+
+
+def send_startup_report_once():
+    """每个系统启动周期只发送一次状态报告。"""
+    try:
+        boot_id = Path(
+            "/proc/sys/kernel/random/boot_id"
+        ).read_text(encoding="utf-8").strip()
+    except OSError:
+        boot_id = str(int(psutil.boot_time()))
+
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT details FROM monitor_state WHERE alert_key = ?",
+            ("vps_boot_report",),
+        ).fetchone()
+
+    # 同一次 VPS 开机期间，不因 SSH 重连或监控服务重启而重复发送。
+    if row and row[0] == boot_id:
+        return
+
+    cpu = psutil.cpu_percent(interval=0.3)
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    disk = psutil.disk_usage("/")
+
+    tz = timezone(timedelta(hours=8))
+    current = datetime.now(tz)
+    boot = datetime.fromtimestamp(
+        psutil.boot_time(), tz=timezone.utc
+    ).astimezone(tz)
+
+    uptime = timedelta(
+        seconds=max(0, int(time.time() - psutil.boot_time()))
+    )
+    uptime_text = (
+        f"{uptime.days}天"
+        f"{uptime.seconds // 3600}小时"
+        f"{(uptime.seconds % 3600) // 60}分钟"
+    )
+
+    service_lines = []
+    for unit, label in [
+        ("echomate-server.service", "Echo-Mate Server"),
+        ("echomate-feishu-bot.service", "飞书机器人"),
+        ("echomate-monitor.service", "VPS 监控"),
+    ]:
+        active = service_is_active(unit)
+        service_lines.append(
+            f"{label}：{'运行正常' if active else '异常/未运行'}"
+        )
+
+    # 首次启用时发送基线报告；以后只在新的系统启动周期报告。
+    heading = (
+        "📊 VPS 监控已启用，当前状态基线"
+        if row is None
+        else "🟢 VPS 已启动，本次开机状态报告"
+    )
+
+    report = (
+        f"{heading}\n"
+        f"主机：{os.uname().nodename}\n"
+        f"报告时间（北京时间）：{current:%Y-%m-%d %H:%M:%S}\n"
+        f"系统启动时间：{boot:%Y-%m-%d %H:%M:%S}\n"
+        f"运行时间：{uptime_text}\n\n"
+        f"CPU：{cpu:.1f}%（{psutil.cpu_count()} 个逻辑核）\n"
+        f"内存：总计 {mem.total / 1024**3:.2f} GiB，"
+        f"可用 {mem.available / 1024**3:.2f} GiB，"
+        f"使用率 {mem.percent:.1f}%\n"
+        f"Swap：已使用 {swap.used / 1024**3:.2f} / "
+        f"{swap.total / 1024**3:.2f} GiB\n"
+        f"磁盘 /：剩余 {disk.free / 1024**3:.2f} / "
+        f"{disk.total / 1024**3:.2f} GiB，"
+        f"使用率 {disk.percent:.1f}%\n\n"
+        "关键服务状态：\n" + "\n".join(service_lines)
+    )
+
+    # 发送失败时不写入 Boot ID，下个检查周期会重试。
+    if not send_feishu(report):
+        return
+
+    timestamp = now_text()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO monitor_state (
+                alert_key, is_active, bad_count, first_bad_at,
+                last_notified_at, details, updated_at
+            )
+            VALUES (?, 0, 0, NULL, ?, ?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET
+                last_notified_at = excluded.last_notified_at,
+                details = excluded.details,
+                updated_at = excluded.updated_at
+            """,
+            ("vps_boot_report", timestamp, boot_id, timestamp),
+        )
+
+    print("[监控] 本次开机状态报告已发送", flush=True)
+
+
+
+def send_startup_menu_once():
+    """每个系统启动周期只发送一次功能菜单。"""
+    try:
+        boot_id = Path(
+            "/proc/sys/kernel/random/boot_id"
+        ).read_text(encoding="utf-8").strip()
+    except OSError:
+        boot_id = str(int(psutil.boot_time()))
+
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT details FROM monitor_state WHERE alert_key = ?",
+            ("vps_startup_menu",),
+        ).fetchone()
+
+    if row and row[0] == boot_id:
+        return
+
+    menu = (
+        "🤖 Echo-Mate 功能菜单\n\n"
+        "请单独发送数字，或单独发送对应文字指令：\n"
+        "1. 检查 VPS\n"
+        "2. 我的待办\n"
+        "3. 添加待办\n"
+        "4. 列出记忆\n"
+        "5. 帮助\n\n"
+        "只有整条消息匹配指令时才执行功能。"
+    )
+
+    if not send_feishu(menu):
+        return
+
+    timestamp = now_text()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO monitor_state (
+                alert_key, is_active, bad_count, first_bad_at,
+                last_notified_at, details, updated_at
+            )
+            VALUES (?, 0, 0, NULL, ?, ?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET
+                last_notified_at = excluded.last_notified_at,
+                details = excluded.details,
+                updated_at = excluded.updated_at
+            """,
+            ("vps_startup_menu", timestamp, boot_id, timestamp),
+        )
+
+    print("[监控] 本启动周期功能菜单已发送", flush=True)
+
+def monitor_loop():
+    init_db()
+
+    print("[监控] Echo-Mate VPS 监控已启动", flush=True)
+    print(
+        f"[监控] 常规检查间隔 {CHECK_INTERVAL}s；"
+        f"磁盘检查间隔 {DISK_INTERVAL}s；"
+        f"告警冷却 {ALERT_COOLDOWN // 60}min",
+        flush=True,
+    )
+
+    last_disk_check = 0.0
+
+    while True:
+        loop_start = time.monotonic()
+
+        try:
+            # SSH 连接报告和菜单由独立会话监控服务负责。
+            check_cpu_memory()
+            check_services()
+
+            if time.monotonic() - last_disk_check >= DISK_INTERVAL:
+                check_disk()
+                last_disk_check = time.monotonic()
+
+        except Exception as exc:
+            print(
+                f"[监控] 本轮检查异常：{type(exc).__name__}",
+                flush=True,
+            )
+
+        elapsed = time.monotonic() - loop_start
+        time.sleep(max(1, CHECK_INTERVAL - elapsed))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="只发送一条测试通知，不启动持续监控",
+    )
+    args = parser.parse_args()
+
+    if args.test:
+        ok = send_feishu(
+            "✅ Echo-Mate VPS 监控测试成功。\n"
+            "飞书主动通知通道已打通。"
+        )
+        raise SystemExit(0 if ok else 1)
+
+    monitor_loop()

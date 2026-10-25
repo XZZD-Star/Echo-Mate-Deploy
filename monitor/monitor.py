@@ -31,6 +31,9 @@ OWNER_OPEN_ID = (os.getenv("LARK_OWNER_OPEN_ID") or "").strip()
 
 DB_PATH = Path("/var/lib/echomate/assistant.db")
 
+# VPS 系统时区是 UTC；所有面向用户的时间统一按北京时间显示。
+LOCAL_TZ = timezone(timedelta(hours=8))
+
 CHECK_INTERVAL = 60
 DISK_INTERVAL = 300
 ALERT_COOLDOWN = 1800
@@ -297,7 +300,7 @@ def evaluate(key, title, abnormal, details,
                 message = (
                     f"{heading}\n\n"
                     f"{details}\n"
-                    f"{current.astimezone().strftime('%H:%M')}"
+                    f"{current.astimezone(LOCAL_TZ).strftime('%H:%M')}"
                 )
 
                 if send_feishu(message):
@@ -322,7 +325,7 @@ def evaluate(key, title, abnormal, details,
 
             message = (
                 f"✅ {friendly}回来了\n\n"
-                f"{current.astimezone().strftime('%H:%M')}"
+                f"{current.astimezone(LOCAL_TZ).strftime('%H:%M')}"
             )
 
             if send_feishu(message):

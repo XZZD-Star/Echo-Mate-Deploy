@@ -1204,6 +1204,12 @@ server_cfg = dotenv_values(SERVER_ENV)
 QWEN_API_KEY = (server_cfg.get("DASHSCOPE_API_KEY") or "").strip()
 QWEN_MODEL = (server_cfg.get("CHAT_MODEL") or "qwen-max").strip()
 
+# 联网搜索：Key 只放 feishu_bot/.env，不进仓库。
+TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
+TAVILY_URL = "https://api.tavily.com/search"
+SEARCH_CACHE_TTL = 600
+_search_cache = {}
+
 # 沿用此前独立 API 测试成功的地域/Workspace 端点选择方式。
 ws_endpoint = (
     server_cfg.get("DASHSCOPE_BASE_WEBSOCKET_API_URL") or ""
@@ -1651,6 +1657,32 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "联网搜索最新信息。"
+                "需要时效性内容（新闻、价格、版本发布、赛事）、"
+                "你不确定的事实、或用户明确要求查资料时调用。"
+                "日常闲聊、常识、你的知识足够回答的问题不要调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词，尽量具体",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "返回条数，1-8，默认 5",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -1810,10 +1842,76 @@ def _tool_search_memories(args):
     }
 
 
+def _tool_web_search(args):
+    """调用 Tavily 搜索，返回标题、链接、摘要。"""
+    query = (args.get("query") or "").strip()
+
+    if not query:
+        return {"ok": False, "error": "缺少搜索关键词"}
+
+    if not TAVILY_API_KEY:
+        return {"ok": False, "error": "未配置 TAVILY_API_KEY"}
+
+    max_results = args.get("max_results") or 5
+    try:
+        max_results = max(1, min(int(max_results), 8))
+    except (TypeError, ValueError):
+        max_results = 5
+
+    cache_key = f"{query.lower()}|{max_results}"
+    cached = _search_cache.get(cache_key)
+    if cached and time.time() - cached[0] < SEARCH_CACHE_TTL:
+        return cached[1]
+
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "max_results": max_results,
+        "include_answer": True,
+        "search_depth": "basic",
+    }
+
+    try:
+        response = requests.post(TAVILY_URL, json=payload, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        print(f"[搜索] 请求失败：{type(exc).__name__}", flush=True)
+        return {"ok": False, "error": "搜索服务暂时不可用"}
+
+    results = []
+    for item in (data.get("results") or [])[:max_results]:
+        results.append({
+            "title": item.get("title") or "",
+            "url": item.get("url") or "",
+            "content": (item.get("content") or "")[:1200],
+        })
+
+    if not results:
+        return {"ok": False, "error": f"没有搜到「{query}」的结果"}
+
+    result = {
+        "ok": True,
+        "query": query,
+        "answer": (data.get("answer") or "")[:800],
+        "results": results,
+    }
+
+    _search_cache[cache_key] = (time.time(), result)
+
+    # 简单限长，避免缓存无限增长。
+    if len(_search_cache) > 50:
+        oldest = min(_search_cache, key=lambda k: _search_cache[k][0])
+        _search_cache.pop(oldest, None)
+
+    return result
+
+
 TOOL_HANDLERS = {
     "get_weather": _tool_get_weather,
     "list_todos": _tool_list_todos,
     "search_memories": _tool_search_memories,
+    "web_search": _tool_web_search,
 }
 
 
@@ -1880,10 +1978,19 @@ def _chat_with_tools(messages):
             result = _run_tool(
                 call.function.name, call.function.arguments
             )
+            payload = json.dumps(result, ensure_ascii=False)
+
+            # 搜索结果可能很长，提示模型这是唯一事实来源。
+            if call.function.name == "web_search":
+                payload = (
+                    "以下是本次搜索的全部事实来源，"
+                    "回答只能基于这些内容：\n" + payload
+                )
+
             working.append({
                 "role": "tool",
                 "tool_call_id": call.id,
-                "content": json.dumps(result, ensure_ascii=False),
+                "content": payload,
             })
 
     # 工具轮数用完，最后要一次纯文本回答。
@@ -1943,8 +2050,17 @@ def generate_ai_reply(chat_id, user_text):
                 "- get_weather：天气、气温、下雨、穿衣、未来几天趋势\n"
                 "- list_todos：用户有哪些待办\n"
                 "- search_memories：翻找用户过去记过的事\n"
+                "- web_search：联网查最新资料（新闻、价格、版本、赛事）\n"
                 "需要数据时直接调用工具，然后基于结果自然回答；"
                 "能对比、能建议、能解释原因就多说一句。\n"
+                "用了 web_search 时，严格按下面的规则写：\n"
+                "1. 只使用工具返回的 title / content / answer 里出现过的事实，"
+                "不要添加任何工具结果里没有的新闻、公司名、金额或版本号。\n"
+                "2. 来源链接只能从工具结果的 url 字段原样复制，"
+                "禁止自己拼 URL 或改路径。\n"
+                "3. 结果里信息不足就直说「搜到的资料有限」，不要补全。\n"
+                "4. 如果多个结果说法冲突，指出冲突，不要挑一个当结论。\n"
+                "5. 回答末尾附 1-3 个来源，格式：标题 - URL。\n"
                 "工具返回 ok=false 时如实说明，不要编造数据。\n\n"
                 "你无法直接创建或删除待办与记忆。"
                 "不要说「告诉我，我帮你记」「随时告诉我」"

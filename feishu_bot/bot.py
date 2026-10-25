@@ -1465,13 +1465,11 @@ def weather_reply(text):
         return None
 
     place = _extract_place(text)
-    source = "你说的"
 
     if not place:
         places = _memory_places()
         if places:
             place = places[0]
-            source = "记忆里的"
 
     if not place:
         return (
@@ -1527,8 +1525,6 @@ def weather_reply(text):
     if rain and rain[0] is not None:
         lines.append(f"降水概率 {rain[0]:.0f}%")
 
-    lines.append("")
-    lines.append(f"地点来源：{source}")
     lines.append("")
     lines.append("0 返回")
 

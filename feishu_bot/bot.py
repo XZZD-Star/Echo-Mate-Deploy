@@ -6,6 +6,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 import psutil
+import requests
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -173,6 +174,7 @@ def init_chat_table():
 PAGES = {
     "menu", "status", "status_detail", "todo", "todo_new",
     "memory", "help", "notify", "quiet", "records",
+    "memory_clear_confirm",
 }
 
 # 0 返回上一级；未列出的页面回到主菜单。
@@ -180,6 +182,7 @@ PAGE_PARENT = {
     "status_detail": "status",
     "quiet": "notify",
     "records": "notify",
+    "memory_clear_confirm": "memory",
 }
 
 SERVICE_UNITS = [
@@ -469,8 +472,10 @@ def render_memory(conn, show_all=False):
 
     lines.extend([
         "",
+        "⚙️ 操作",
         "查：查记忆 回答",
         "存：记住：喜欢简短回答",
+        "删：删除记忆 3",
     ])
 
     if show_all:
@@ -604,6 +609,13 @@ def render_page(conn, chat_id, page):
         return render_quiet()
     if page == "records":
         return render_records()
+    if page == "memory_clear_confirm":
+        return (
+            "⚠️ 清空全部记忆？\n\n"
+            "删除后无法恢复。\n"
+            "确认发：确认清空记忆\n"
+            "取消发：0"
+        )
     return menu_text()
 
 
@@ -1101,15 +1113,63 @@ def handle_command(conn, text, chat_id):
 
     if match:
         memory_id = int(match.group(1))
-        cursor = conn.execute(
+        row = conn.execute(
+            "SELECT content FROM memories WHERE id = ? AND owner_id = ?",
+            (memory_id, OWNER_OPEN_ID),
+        ).fetchone()
+
+        if not row:
+            return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
+
+        conn.execute(
             "DELETE FROM memories WHERE id = ? AND owner_id = ?",
             (memory_id, OWNER_OPEN_ID),
         )
+        preview = row[0][:40]
+        return (
+            f"✅ 删掉了 #{memory_id}\n\n"
+            f"{preview}\n\n"
+            "4 看记忆 · 0 返回"
+        )
 
-        if cursor.rowcount:
-            return f"✅ #{memory_id} 删掉了\n\n4 看记忆 · 0 返回"
+    # 清空全部记忆需要两步确认，避免误触。
+    if text in {"清空记忆", "删除全部记忆"}:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE owner_id = ?",
+            (OWNER_OPEN_ID,),
+        ).fetchone()[0]
 
-        return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
+        if not total:
+            return "📚 本来就没有记忆\n\n0 返回"
+
+        set_page(chat_id, "memory_clear_confirm", conn=conn)
+        return (
+            f"⚠️ 要清空全部 {total} 条记忆？\n\n"
+            "删除后无法恢复。\n"
+            "确认发：确认清空记忆\n"
+            "取消发：0\n\n"
+            "0 取消"
+        )
+
+    if text == "确认清空记忆":
+        total = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE owner_id = ?",
+            (OWNER_OPEN_ID,),
+        ).fetchone()[0]
+
+        if not total:
+            set_page(chat_id, "memory", conn=conn)
+            return "📚 本来就没有记忆\n\n0 返回"
+
+        conn.execute(
+            "DELETE FROM memories WHERE owner_id = ?", (OWNER_OPEN_ID,)
+        )
+        set_page(chat_id, "memory", conn=conn)
+        return (
+            f"✅ 清空了 {total} 条记忆\n\n"
+            "以后想存新的，发：记住：内容\n\n"
+            "0 返回"
+        )
 
     # -------- 自然输入：日期/今天明天 + 时间 + 事项 --------
 
@@ -1223,9 +1283,256 @@ def memory_system_block(items):
         "<memory>\n"
         f"{lines}\n"
         "</memory>\n"
-        "如果记忆和当前问题无关，可以忽略；"
-        "不要凭空补充记忆里没有的内容。"
+        "使用规则：\n"
+        "1. 问题涉及用户个人属性（居住地、生日、职业、偏好、称呼等）时，"
+        "必须使用上面的记忆，不要反问用户。\n"
+        "2. 记忆里没有的信息，直接说不知道，不要编造。\n"
+        "3. 记忆和问题确实无关时才可以忽略。"
     )
+
+
+WEATHER_KEYWORDS = ("天气", "气温", "温度", "下雨", "降雨", "下雪")
+
+# WMO 天气代码 -> 中文
+WMO_TEXT = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
+    45: "雾", 48: "雾凇",
+    51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+    56: "冻毛毛雨", 57: "强冻毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "强冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+    80: "小阵雨", 81: "阵雨", 82: "强阵雨",
+    85: "小阵雪", 86: "大阵雪",
+    95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷阵雨伴冰雹",
+}
+
+WEATHER_SUFFIXES = (
+    "市", "区", "县", "镇", "乡", "省", "自治区", "特别行政区",
+)
+
+
+def _is_weather_question(text):
+    return any(word in (text or "") for word in WEATHER_KEYWORDS)
+
+
+def _extract_place(text):
+    """从问句里抽地名，抽不到返回 None。"""
+    raw = (text or "").strip()
+
+    # 去掉常见疑问词和天气词，剩下的当候选地名。
+    cleaned = raw
+    for word in (
+        "今天", "明天", "后天", "现在", "当前", "这边", "那边",
+        "天气", "气温", "温度", "怎么样", "如何", "多少", "几度",
+        "会", "下", "有", "的", "吗", "呢", "啊", "？", "?", "，", ",",
+    ):
+        cleaned = cleaned.replace(word, " ")
+
+    for token in re.split(r"\s+", cleaned):
+        token = token.strip()
+        if len(token) >= 2:
+            return token
+
+    return None
+
+
+def _memory_places():
+    """从记忆里抽居住地候选，按记忆新旧排序。"""
+    candidates = []
+
+    for item in load_memory_context():
+        if not any(
+            word in item for word in ("居住", "住在", "家住", "所在地", "城市")
+        ):
+            continue
+
+        match = re.search(
+            r"(?:居住地|住在|家住|所在地|城市)(?:是|在|为|：|:)?\s*"
+            r"([\u4e00-\u9fa5]{2,20})",
+            item,
+        )
+        if match:
+            candidates.append(match.group(1))
+
+    return candidates
+
+
+PROVINCES = (
+    "北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林",
+    "黑龙江", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
+    "湖北", "湖南", "广东", "海南", "四川", "贵州", "云南", "陕西",
+    "甘肃", "青海", "台湾", "内蒙古", "广西", "西藏", "宁夏", "新疆",
+    "香港", "澳门",
+)
+
+
+def _place_candidates(place):
+    """生成地名候选，覆盖「江西南昌」「南昌市」「南昌市西湖区」等写法。"""
+    candidates = []
+
+    def add(value):
+        value = (value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(place)
+
+    # 去掉行政后缀
+    trimmed = place
+    for suffix in WEATHER_SUFFIXES:
+        if trimmed.endswith(suffix) and len(trimmed) > len(suffix):
+            trimmed = trimmed[: -len(suffix)]
+            add(trimmed)
+            break
+
+    # 去掉省级前缀：「江西南昌」→「南昌」
+    for province in PROVINCES:
+        if trimmed.startswith(province) and len(trimmed) > len(province):
+            add(trimmed[len(province):])
+            break
+
+    # 「南昌市西湖区」这类：再截到区县
+    for suffix in ("区", "县"):
+        if trimmed.endswith(suffix):
+            core = trimmed[: -len(suffix)]
+            for province in PROVINCES:
+                if core.startswith(province):
+                    core = core[len(province):]
+                    break
+            add(core)
+            break
+
+    return candidates
+
+
+def _geocode(place):
+    """把地名换成经纬度，按候选列表逐个尝试。"""
+    for candidate in _place_candidates(place):
+        try:
+            response = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={
+                    "name": candidate,
+                    "count": 1,
+                    "language": "zh",
+                    "format": "json",
+                },
+                timeout=8,
+            )
+            data = response.json()
+        except Exception:
+            continue
+
+        results = data.get("results") or []
+        if results:
+            top = results[0]
+            return {
+                "name": top.get("name", candidate),
+                "admin": top.get("admin1", ""),
+                "lat": top.get("latitude"),
+                "lon": top.get("longitude"),
+            }
+
+    return None
+
+
+def _fetch_weather(place_info, days=1):
+    try:
+        response = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": place_info["lat"],
+                "longitude": place_info["lon"],
+                "current": "temperature_2m,relative_humidity_2m,weather_code",
+                "daily": (
+                    "temperature_2m_max,temperature_2m_min,"
+                    "weather_code,precipitation_probability_max"
+                ),
+                "timezone": "Asia/Shanghai",
+                "forecast_days": days,
+            },
+            timeout=8,
+        )
+        return response.json()
+    except Exception:
+        return None
+
+
+def weather_reply(text):
+    """回答天气问题；无法回答时返回 None，交给普通聊天。"""
+    if not _is_weather_question(text):
+        return None
+
+    place = _extract_place(text)
+    source = "你说的"
+
+    if not place:
+        places = _memory_places()
+        if places:
+            place = places[0]
+            source = "记忆里的"
+
+    if not place:
+        return (
+            "🌤 想知道哪里的天气？\n\n"
+            "发「南昌天气」这样就行\n"
+            "或者先存一条：记住：我现在居住地是江西南昌\n\n"
+            "0 返回"
+        )
+
+    place_info = _geocode(place)
+    if not place_info:
+        return (
+            f"😅 没找到「{place}」这个地方\n\n"
+            "换个写法试试，比如只发城市名\n\n"
+            "0 返回"
+        )
+
+    data = _fetch_weather(place_info)
+    if not data:
+        return "😅 天气服务暂时连不上，稍后再试\n\n0 返回"
+
+    current = data.get("current") or {}
+    daily = data.get("daily") or {}
+
+    temp = current.get("temperature_2m")
+    humidity = current.get("relative_humidity_2m")
+    code = current.get("weather_code")
+
+    if temp is None:
+        return "😅 天气数据不完整，稍后再试\n\n0 返回"
+
+    condition = WMO_TEXT.get(code, "未知")
+
+    label = place_info["name"]
+    if place_info.get("admin") and place_info["admin"] != label:
+        label = f"{place_info['admin']}{label}"
+
+    lines = [
+        f"🌤 {label}天气",
+        "",
+        f"现在 {temp:.0f}°C · {condition}",
+    ]
+
+    if humidity is not None:
+        lines[-1] += f" · 湿度 {humidity:.0f}%"
+
+    highs = daily.get("temperature_2m_max") or []
+    lows = daily.get("temperature_2m_min") or []
+    if highs and lows:
+        lines.append(f"今天 {lows[0]:.0f}–{highs[0]:.0f}°C")
+
+    rain = daily.get("precipitation_probability_max") or []
+    if rain and rain[0] is not None:
+        lines.append(f"降水概率 {rain[0]:.0f}%")
+
+    lines.append("")
+    lines.append(f"地点来源：{source}")
+    lines.append("")
+    lines.append("0 返回")
+
+    return "\n".join(lines)
 
 
 def generate_ai_reply(chat_id, user_text):
@@ -1569,6 +1876,9 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
     if reply is None:
         reply = todo_hint_reply(user_text)
+
+    if reply is None:
+        reply = weather_reply(user_text)
 
     if reply is None:
         reply = generate_ai_reply(message.chat_id, user_text)

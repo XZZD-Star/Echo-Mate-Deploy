@@ -1167,6 +1167,67 @@ if QWEN_API_KEY:
     )
 
 
+MEMORY_CONTEXT_LIMIT = 50
+
+
+def _normalize_memory(text):
+    """用于去重的归一化：去空白、去标点、统一小写。"""
+    return re.sub(r"[\s，。！？、,.!?：:；;]+", "", text or "").lower()
+
+
+def load_memory_context(limit=MEMORY_CONTEXT_LIMIT):
+    """读取最近记忆，去重后返回列表。"""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        rows = conn.execute(
+            """
+            SELECT content FROM memories
+            WHERE owner_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (OWNER_OPEN_ID, limit * 3),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    seen = set()
+    items = []
+
+    for (content,) in rows:
+        content = (content or "").strip()
+        if not content:
+            continue
+
+        key = _normalize_memory(content)
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        items.append(content)
+
+        if len(items) >= limit:
+            break
+
+    return items
+
+
+def memory_system_block(items):
+    """把记忆整理成 system prompt 片段。"""
+    if not items:
+        return ""
+
+    lines = "\n".join(f"- {item}" for item in items)
+    return (
+        "\n\n以下是用户主动让你记住的信息，回答时可以直接使用：\n"
+        "<memory>\n"
+        f"{lines}\n"
+        "</memory>\n"
+        "如果记忆和当前问题无关，可以忽略；"
+        "不要凭空补充记忆里没有的内容。"
+    )
+
+
 def generate_ai_reply(chat_id, user_text):
     """使用 Qwen 回复普通聊天，并保存近期上下文。"""
     if qwen_client is None:
@@ -1196,6 +1257,8 @@ def generate_ai_reply(chat_id, user_text):
         for role, content in reversed(rows)
     ]
 
+    memory_items = load_memory_context()
+
     messages = [
         {
             "role": "system",
@@ -1212,6 +1275,7 @@ def generate_ai_reply(chat_id, user_text):
                 "- 保存记忆：记住：内容\n"
                 "- 查看记忆：列出记忆\n"
                 "你不能声称已经完成任何实际未执行的操作。"
+                + memory_system_block(memory_items)
             ),
         },
         *history,

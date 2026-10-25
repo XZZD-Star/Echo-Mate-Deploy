@@ -4,6 +4,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 import psutil
 import threading
 import time
@@ -43,6 +44,20 @@ if not OWNER_OPEN_ID.startswith("ou_"):
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 os.chmod(DB_PATH.parent, 0o700)
+
+
+@contextmanager
+def db_conn():
+    """连接用完必须关闭，否则 WAL 下会累积句柄并持有写锁。"""
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def now_utc():
@@ -848,7 +863,7 @@ def reminder_loop():
                 datetime.now(timezone.utc) - timedelta(seconds=60)
             ).isoformat(timespec="seconds")
 
-            with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            with db_conn() as conn:
                 rows = conn.execute(
                     """
                     SELECT id, title, due_at_utc, chat_id
@@ -870,7 +885,7 @@ def reminder_loop():
                 attempt_time = now_utc()
 
                 # 先记录尝试时间，避免发送失败时每 15 秒刷屏。
-                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                with db_conn() as conn:
                     cursor = conn.execute(
                         """
                         UPDATE todos
@@ -906,7 +921,7 @@ def reminder_loop():
                     sent = False
 
                 if sent:
-                    with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                    with db_conn() as conn:
                         conn.execute(
                             """
                             UPDATE todos

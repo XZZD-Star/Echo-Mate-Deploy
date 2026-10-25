@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import psutil
 import threading
 import time
@@ -14,6 +15,10 @@ import lark_oapi as lark
 from dotenv import load_dotenv, dotenv_values
 from urllib.parse import urlparse
 from openai import OpenAI
+
+# 主动播报队列：与 AIChat Server 共用同一份 SQLite，纯标准库实现。
+sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
+from tools import notify_store
 
 
 # ==================== 配置 ====================
@@ -138,7 +143,8 @@ def menu_text():
         "2. 我的待办\n"
         "3. 添加待办\n"
         "4. 列出记忆\n"
-        "5. 帮助\n\n"
+        "5. 帮助\n"
+        "6. 播报设置\n\n"
         "可以发送数字或单独发送对应的功能指令。"
     )
 
@@ -157,7 +163,15 @@ def help_text():
         "完成待办 1\n"
         "取消待办 1\n\n"
         "待办时间采用北京时间（Asia/Shanghai）。\n"
-        "到期后机器人会通过飞书发送提醒。"
+        "到期后机器人会通过飞书发送提醒。\n\n"
+        "【主动播报】\n"
+        "播报设置\n"
+        "静音 23:00 08:00\n"
+        "关闭静音\n"
+        "关闭待办播报 / 开启待办播报\n"
+        "关闭监控播报 / 开启监控播报\n"
+        "播报记录\n\n"
+        "桌宠停在桌宠页面且空闲时才会开口播报。"
     )
 
 
@@ -233,6 +247,91 @@ def vps_status_text():
     return "\n".join(lines)
 
 
+
+def _normalize_hhmm(value):
+    """把 9:05 这类写法规范成 09:05，非法返回 None。"""
+    try:
+        hour, minute = value.split(":", 1)
+        hour = int(hour)
+        minute = int(minute)
+    except (TypeError, ValueError):
+        return None
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _kind_label(kind):
+    return {
+        "todo": "待办",
+        "alert": "监控告警",
+        "recovery": "监控恢复",
+        "manual": "手动测试",
+    }.get(kind, kind)
+
+
+def notify_settings_text():
+    todo_on = notify_store.get_setting("notify_todo_enabled", "1") == "1"
+    monitor_on = (
+        notify_store.get_setting("notify_monitor_enabled", "1") == "1"
+    )
+
+    lines = [
+        "🔊 主动播报设置",
+        f"静音时段：{notify_store.quiet_text()}",
+        f"待办播报：{'开启' if todo_on else '关闭'}",
+        f"监控播报：{'开启' if monitor_on else '关闭'}",
+        f"待播通知：{notify_store.pending_count()} 条",
+        "",
+        "发送以下命令可修改：",
+        "静音 23:00 08:00",
+        "关闭静音",
+        "关闭待办播报 / 开启待办播报",
+        "关闭监控播报 / 开启监控播报",
+        "播报记录",
+    ]
+    return "\n".join(lines)
+
+
+def notify_records_text(limit=10):
+    rows = notify_store.recent_records(limit)
+
+    if not rows:
+        return "目前还没有主动播报记录。"
+
+    status_label = {
+        "pending": "待播",
+        "claimed": "播放中",
+        "sent": "已播",
+        "failed": "失败",
+        "expired": "已过期",
+    }
+
+    lines = [f"📢 最近 {len(rows)} 条播报记录："]
+
+    for row in rows:
+        sent = (row["sent_at_utc"] or "").replace("T", " ")[:16]
+        acked = "已确认" if row["acked_at_utc"] else "未确认"
+        status = status_label.get(row["status"], row["status"])
+
+        if row["status"] == "sent":
+            tail = acked
+        elif row["last_error"]:
+            tail = f"错误：{row['last_error'][:40]}"
+        else:
+            tail = ""
+
+        lines.append(
+            f"\n#{row['id']}｜{_kind_label(row['kind'])}｜{status}"
+            f"｜{sent}{('｜' + tail) if tail else ''}"
+            f"\n{row['text'][:60]}"
+        )
+
+    return "\n".join(lines)
+
+
 def handle_command(conn, text, chat_id):
     # Exact menu command mapping
     text = {
@@ -241,6 +340,7 @@ def handle_command(conn, text, chat_id):
         "3": "添加待办",
         "4": "列出记忆",
         "5": "帮助",
+        "6": "播报设置",
     }.get(text, text)
     text = text.strip()
 
@@ -252,6 +352,63 @@ def handle_command(conn, text, chat_id):
 
     if text == "帮助":
         return help_text()
+
+    # -------- 主动播报设置（P3） --------
+
+    if text in {"播报设置", "语音播报设置"}:
+        return notify_settings_text()
+
+    match = re.match(
+        r"^静音\s+(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\s*$",
+        text,
+    )
+
+    if match:
+        start_text, end_text = match.groups()
+        start = _normalize_hhmm(start_text)
+        end = _normalize_hhmm(end_text)
+
+        if start is None or end is None:
+            return "时间格式不正确，请使用 HH:MM，例如：静音 23:00 08:00"
+
+        if start == end:
+            return "开始和结束时间不能相同。"
+
+        notify_store.set_setting("notify_quiet_start", start)
+        notify_store.set_setting("notify_quiet_end", end)
+
+        return (
+            f"🔇 已设置静音时段：{start} - {end}（北京时间）\n"
+            "该时段内桌宠不会主动开口，飞书通知不受影响。\n"
+            "服务端最多 60 秒内生效，无需重启。"
+        )
+
+    if text in {"关闭静音", "取消静音"}:
+        notify_store.set_setting("notify_quiet_start", "")
+        notify_store.set_setting("notify_quiet_end", "")
+        return "🔔 已关闭静音时段，桌宠全天可播报。"
+
+    match = re.match(
+        r"^(关闭|开启)(待办|监控)播报$",
+        text,
+    )
+
+    if match:
+        action, target = match.groups()
+        enabled = "1" if action == "开启" else "0"
+        key = (
+            "notify_todo_enabled"
+            if target == "待办"
+            else "notify_monitor_enabled"
+        )
+        notify_store.set_setting(key, enabled)
+
+        state_text = "开启" if enabled == "1" else "关闭"
+        return f"✅ 已{state_text}{target}类主动播报。"
+
+    if text in {"播报记录", "语音播报记录"}:
+        return notify_records_text()
+
 
     # -------- 创建待办 --------
 
@@ -758,6 +915,23 @@ def reminder_loop():
                               AND reminded_at_utc IS NULL
                             """,
                             (now_utc(), todo_id),
+                        )
+
+                    # 飞书提醒成功后，同步排入桌宠播报队列。
+                    # 失败不影响飞书，也不阻塞调度器。
+                    try:
+                        notify_store.enqueue(
+                            kind="todo",
+                            text=f"待办提醒：{title}",
+                            dedupe_key=f"todo:{todo_id}",
+                            priority=5,
+                            ttl_minutes=120,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[待办] #{todo_id} 入播报队列失败："
+                            f"{type(exc).__name__}",
+                            flush=True,
                         )
                 else:
                     print(

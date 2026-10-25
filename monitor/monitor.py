@@ -10,6 +10,11 @@ import lark_oapi as lark
 from dotenv import load_dotenv
 import os
 import json
+import sys
+
+# 主动播报队列：与 AIChat Server 共用同一份 SQLite。
+sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
+from tools import notify_store
 
 
 # ================= 配置 =================
@@ -186,6 +191,46 @@ def save_state(key, state, details):
         )
 
 
+def spoken_alert_text(title, details, recovery=False):
+    """把监控项转成适合朗读的短句，不念多行原文。"""
+    label = title
+
+    if label.startswith("服务状态："):
+        service = label.split("：", 1)[1]
+        friendly = {
+            "echomate-server.service": "语音服务",
+            "echomate-feishu-bot.service": "飞书机器人",
+        }.get(service, service)
+        label = friendly
+
+    if recovery:
+        return f"VPS 的{label}已恢复。"
+
+    return f"注意，VPS 的{label}异常。"
+
+
+def queue_spoken_alert(key, title, details, state,
+                       recovery=False):
+    """写入播报队列。失败只记日志，不影响飞书告警。"""
+    try:
+        dedupe_key = None
+        if not recovery and state.get("first_bad"):
+            dedupe_key = f"monitor:{key}:{state['first_bad']}"
+
+        notify_store.enqueue(
+            kind="recovery" if recovery else "alert",
+            text=spoken_alert_text(title, details, recovery),
+            dedupe_key=dedupe_key,
+            priority=3 if recovery else 1,
+            ttl_minutes=10 if recovery else 30,
+        )
+    except Exception as exc:
+        print(
+            f"[播报] {key} 入队失败：{type(exc).__name__}",
+            flush=True,
+        )
+
+
 def evaluate(key, title, abnormal, details,
              min_count=1, min_duration=0):
     """记录连续异常，只在达到阈值时告警，恢复后发送恢复通知。"""
@@ -237,6 +282,9 @@ def evaluate(key, title, abnormal, details,
                     state["last_notified"] = current.isoformat(
                         timespec="seconds"
                     )
+                    queue_spoken_alert(
+                        key, title, details, state
+                    )
     else:
         state["count"] = 0
         state["first_bad"] = None
@@ -252,6 +300,9 @@ def evaluate(key, title, abnormal, details,
             if send_feishu(message):
                 state["active"] = False
                 state["last_notified"] = None
+                queue_spoken_alert(
+                    key, title, details, state, recovery=True
+                )
 
     save_state(key, state, details)
 

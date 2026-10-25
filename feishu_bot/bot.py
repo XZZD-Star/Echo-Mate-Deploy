@@ -1584,6 +1584,322 @@ def weather_reply(text):
     return "\n".join(lines)
 
 
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": (
+                "查询某个地点的实时天气和未来几天预报。"
+                "用户问天气、气温、下雨、穿衣建议、温差、"
+                "未来几天冷不冷等问题时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place": {
+                        "type": "string",
+                        "description": (
+                            "城市名。用户没指定时留空，"
+                            "系统会用记忆里的居住地。"
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "需要几天预报，1-7，默认 3",
+                    },
+                    "day_offset": {
+                        "type": "integer",
+                        "description": (
+                            "从哪天开始：0=今天，1=明天，2=后天。"
+                            "用户问明天天气时传 1。"
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_todos",
+            "description": (
+                "列出用户当前未完成的待办。"
+                "用户问有什么待办、今天要做什么、任务清单时调用。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memories",
+            "description": (
+                "在用户保存的记忆里按关键词搜索。"
+                "用户问起过去记过的事情、偏好、经历时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "要搜索的关键词，留空则返回最近的记忆",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+
+def _tool_get_weather(args):
+    place = (args.get("place") or "").strip()
+    days = args.get("days") or 3
+
+    try:
+        days = max(1, min(int(days), 7))
+    except (TypeError, ValueError):
+        days = 3
+
+    try:
+        offset = max(0, min(int(args.get("day_offset") or 0), 6))
+    except (TypeError, ValueError):
+        offset = 0
+
+    # 从今天开始取，保证 offset 之后的日期都在结果里。
+    fetch_days = min(7, offset + days)
+
+    place_info = None
+
+    if place:
+        place_info = _geocode(place)
+
+    if not place_info:
+        places = _memory_places()
+        if places:
+            place_info = _geocode(places[0])
+            if place_info and not place:
+                place = places[0]
+
+    if not place_info:
+        return {
+            "ok": False,
+            "error": (
+                f"找不到地点「{place}」"
+                if place
+                else "没有地点，也没有记忆里的居住地"
+            ),
+        }
+
+    data = _fetch_weather(place_info, days=fetch_days)
+    if not data:
+        return {"ok": False, "error": "天气服务暂时不可用"}
+
+    current = data.get("current") or {}
+    daily = data.get("daily") or {}
+
+    label = place_info["name"]
+    admin = place_info.get("admin") or ""
+    if admin and admin not in label and label not in admin:
+        label = f"{admin}{label}"
+
+    forecast = []
+    dates = daily.get("time") or []
+    highs = daily.get("temperature_2m_max") or []
+    lows = daily.get("temperature_2m_min") or []
+    codes = daily.get("weather_code") or []
+    rains = daily.get("precipitation_probability_max") or []
+
+    for index in range(offset, min(offset + days, len(dates))):
+        forecast.append({
+            "date": dates[index],
+            "high_c": round(highs[index], 1) if index < len(highs) else None,
+            "low_c": round(lows[index], 1) if index < len(lows) else None,
+            "condition": WMO_TEXT.get(
+                codes[index] if index < len(codes) else -1, "未知"
+            ),
+            "rain_chance": (
+                round(rains[index]) if index < len(rains)
+                and rains[index] is not None else None
+            ),
+        })
+
+    return {
+        "ok": True,
+        "place": label,
+        "now": {
+            "temp_c": (
+                round(current["temperature_2m"], 1)
+                if current.get("temperature_2m") is not None else None
+            ),
+            "condition": WMO_TEXT.get(current.get("weather_code"), "未知"),
+            "humidity": (
+                round(current["relative_humidity_2m"])
+                if current.get("relative_humidity_2m") is not None else None
+            ),
+        },
+        "forecast": forecast,
+    }
+
+
+def _tool_list_todos(args):
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, due_at_utc
+            FROM todos
+            WHERE owner_id = ? AND status = 'pending'
+            ORDER BY due_at_utc ASC
+            LIMIT 20
+            """,
+            (OWNER_OPEN_ID,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": [
+            {
+                "id": todo_id,
+                "title": title,
+                "due": format_due_friendly(due_utc),
+            }
+            for todo_id, title, due_utc in rows
+        ],
+    }
+
+
+def _tool_search_memories(args):
+    keyword = (args.get("keyword") or "").strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        if keyword:
+            rows = conn.execute(
+                """
+                SELECT id, content FROM memories
+                WHERE owner_id = ? AND content LIKE ?
+                ORDER BY id DESC LIMIT 10
+                """,
+                (OWNER_OPEN_ID, f"%{keyword}%"),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, content FROM memories
+                WHERE owner_id = ?
+                ORDER BY id DESC LIMIT 10
+                """,
+                (OWNER_OPEN_ID,),
+            ).fetchall()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": [
+            {"id": memory_id, "content": content}
+            for memory_id, content in rows
+        ],
+    }
+
+
+TOOL_HANDLERS = {
+    "get_weather": _tool_get_weather,
+    "list_todos": _tool_list_todos,
+    "search_memories": _tool_search_memories,
+}
+
+
+def _run_tool(name, arguments):
+    handler = TOOL_HANDLERS.get(name)
+    if handler is None:
+        return {"ok": False, "error": f"未知工具：{name}"}
+
+    try:
+        args = json.loads(arguments or "{}")
+        if not isinstance(args, dict):
+            args = {}
+    except json.JSONDecodeError:
+        args = {}
+
+    try:
+        return handler(args)
+    except Exception as exc:
+        print(f"[工具] {name} 执行失败：{type(exc).__name__}", flush=True)
+        return {"ok": False, "error": "工具执行失败"}
+
+
+MAX_TOOL_ROUNDS = 4
+
+
+def _chat_with_tools(messages):
+    """跑工具调用循环，返回最终自然语言回复。"""
+    working = list(messages)
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = qwen_client.chat.completions.create(
+            model=QWEN_MODEL,
+            messages=working,
+            tools=CHAT_TOOLS,
+            tool_choice="auto",
+            max_tokens=700,
+        )
+
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None)
+
+        if not tool_calls:
+            content = message.content
+            return content.strip() if isinstance(content, str) else ""
+
+        # 把助手的 tool_calls 原样放回对话，再逐个回填结果。
+        working.append({
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+                for call in tool_calls
+            ],
+        })
+
+        for call in tool_calls:
+            result = _run_tool(
+                call.function.name, call.function.arguments
+            )
+            working.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+    # 工具轮数用完，最后要一次纯文本回答。
+    final = qwen_client.chat.completions.create(
+        model=QWEN_MODEL,
+        messages=working
+        + [{
+            "role": "user",
+            "content": "请基于上面的工具结果直接回答，不要再调用工具。",
+        }],
+        max_tokens=700,
+    )
+    content = final.choices[0].message.content
+    return content.strip() if isinstance(content, str) else ""
+
+
 def generate_ai_reply(chat_id, user_text):
     """使用 Qwen 回复普通聊天，并保存近期上下文。"""
     if qwen_client is None:
@@ -1619,18 +1935,24 @@ def generate_ai_reply(chat_id, user_text):
         {
             "role": "system",
             "content": (
-                "你是 Echo-Mate Personal Assistant，"
-                "请使用简体中文回答，表达自然、清晰、简洁。\n\n"
-                "重要限制：你没有添加、查询、修改、删除待办或记忆的"
-                "能力，也没有读取数据库的能力。\n"
-                "当用户想管理待办或记忆时，绝对不要假装已经完成，"
-                "不要编造任何待办列表、编号或记忆内容。\n"
-                "只回复一句引导语：\n"
-                "- 添加待办：添加待办 2026-10-26 09:30 事项\n"
-                "- 查看待办：我的待办\n"
-                "- 保存记忆：记住：内容\n"
-                "- 查看记忆：列出记忆\n"
-                "你不能声称已经完成任何实际未执行的操作。"
+                "你是 Echo-Mate，用户的个人助手。"
+                "用简体中文自然对话，像朋友聊天，简洁但有信息量。\n"
+                "不要套固定格式，不要每次都列清单，"
+                "不要加「0 返回」这类导航提示。\n\n"
+                "你可以调用工具获取实时信息：\n"
+                "- get_weather：天气、气温、下雨、穿衣、未来几天趋势\n"
+                "- list_todos：用户有哪些待办\n"
+                "- search_memories：翻找用户过去记过的事\n"
+                "需要数据时直接调用工具，然后基于结果自然回答；"
+                "能对比、能建议、能解释原因就多说一句。\n"
+                "工具返回 ok=false 时如实说明，不要编造数据。\n\n"
+                "你无法直接创建或删除待办与记忆。"
+                "不要说「告诉我，我帮你记」「随时告诉我」"
+                "这类暗示你能代办的句子，因为你做不到。"
+                "需要时直接给出命令，例如："
+                "添加待办 2026-10-26 09:30 交周报。\n"
+                "问天气时，如果用户说今天/明天/后天，"
+                "调用 get_weather 并传对应 day_offset。"
                 + memory_system_block(memory_items)
             ),
         },
@@ -1639,17 +1961,9 @@ def generate_ai_reply(chat_id, user_text):
     ]
 
     try:
-        response = qwen_client.chat.completions.create(
-            model=QWEN_MODEL,
-            messages=messages,
-            max_tokens=700,
-        )
-
-        reply = response.choices[0].message.content
-        if not isinstance(reply, str) or not reply.strip():
+        reply = _chat_with_tools(messages)
+        if not reply:
             return "😅 这次没想出来，换个说法试试"
-
-        reply = reply.strip()
 
     except Exception as exc:
         # 避免将请求内容或凭证写入日志。
@@ -1925,9 +2239,6 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
     if reply is None:
         reply = todo_hint_reply(user_text)
-
-    if reply is None:
-        reply = weather_reply(user_text)
 
     if reply is None:
         reply = generate_ai_reply(message.chat_id, user_text)

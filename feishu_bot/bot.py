@@ -689,6 +689,147 @@ def _handle_page_number(conn, chat_id, page, text):
     return None
 
 
+def _add_todo(conn, chat_id, date_text, time_text, title):
+    """创建待办，供严格格式与自然输入共用。"""
+    title = (title or "").strip()
+
+    if not title:
+        return "😅 待办得写点内容\n\n3 重填 · 0 返回"
+
+    if len(title) > 200:
+        return "😅 标题太长，200 字以内\n\n3 重填 · 0 返回"
+
+    try:
+        due_local = datetime.strptime(
+            f"{date_text} {time_text}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=LOCAL_TZ)
+    except ValueError:
+        return "😅 日期写成 2026-10-26 09:30 这样\n\n3 重填 · 0 返回"
+
+    if due_local <= datetime.now(LOCAL_TZ):
+        return "😅 这个时间已经过去了\n\n3 重填 · 0 返回"
+
+    due_utc = due_local.astimezone(timezone.utc).isoformat(
+        timespec="seconds"
+    )
+
+    cursor = conn.execute(
+        """
+        INSERT INTO todos
+            (owner_id, title, due_at_utc, timezone,
+             status, created_at_utc, chat_id)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        """,
+        (
+            OWNER_OPEN_ID,
+            title,
+            due_utc,
+            "Asia/Shanghai",
+            now_utc(),
+            chat_id,
+        ),
+    )
+
+    return (
+        f"✅ 记下了 #{cursor.lastrowid}\n\n"
+        f"{title} · {format_due_friendly(due_utc)}\n"
+        "到点我会提醒你\n\n"
+        "2 看待办 · 0 返回"
+    )
+
+
+def _parse_natural_todo(text, allow_time_only=False):
+    """解析自然输入，返回 (日期, 时间, 标题) 或 None。
+
+    支持：
+      2026-10-25 14：54 呼叫林梦雨   （全角/半角/点号均可）
+      今天 14:54 呼叫林梦雨
+      明天 9:05 交周报
+      14:54 呼叫林梦雨              （仅待办页内）
+    """
+    raw = (text or "").strip()
+    sep = r"[:：.．]"
+
+    match = re.match(
+        rf"^(\d{{4}}-\d{{2}}-\d{{2}})\s+(\d{{1,2}})\s*{sep}\s*(\d{{2}})\s+(.+)$",
+        raw,
+        re.DOTALL,
+    )
+    if match:
+        date_text, hour, minute, title = match.groups()
+        return date_text, f"{int(hour):02d}:{minute}", title.strip()
+
+    match = re.match(
+        rf"^(今天|明天|后天)\s+(\d{{1,2}})\s*{sep}\s*(\d{{2}})\s+(.+)$",
+        raw,
+        re.DOTALL,
+    )
+    if match:
+        day_text, hour, minute, title = match.groups()
+        offset = {"今天": 0, "明天": 1, "后天": 2}[day_text]
+        target = datetime.now(LOCAL_TZ).date() + timedelta(days=offset)
+        return (
+            target.strftime("%Y-%m-%d"),
+            f"{int(hour):02d}:{minute}",
+            title.strip(),
+        )
+
+    if allow_time_only:
+        match = re.match(
+            rf"^(\d{{1,2}})\s*{sep}\s*(\d{{2}})\s+(.+)$",
+            raw,
+            re.DOTALL,
+        )
+        if match:
+            hour, minute, title = match.groups()
+            now = datetime.now(LOCAL_TZ)
+            target = now.date()
+            candidate = now.replace(
+                hour=int(hour), minute=int(minute),
+                second=0, microsecond=0,
+            )
+            if candidate <= now:
+                target = target + timedelta(days=1)
+            return (
+                target.strftime("%Y-%m-%d"),
+                f"{int(hour):02d}:{minute}",
+                title.strip(),
+            )
+
+    return None
+
+
+def _looks_like_todo(text):
+    """判断消息是否明显在说待办，用于拦截 AI。"""
+    raw = (text or "").strip()
+
+    if any(
+        word in raw
+        for word in ("待办", "提醒我", "提醒一下", "记得提醒")
+    ):
+        return True
+
+    if _parse_natural_todo(raw) is not None:
+        return True
+
+    return False
+
+
+def todo_hint_reply(text):
+    """看起来像待办但没解析成功时，给格式引导而不是交给 AI。"""
+    if not _looks_like_todo(text):
+        return None
+
+    return (
+        "😅 这条没接上\n\n"
+        "新待办这样发：\n"
+        "添加待办 2026-10-26 09:30 交周报\n\n"
+        "也可以直接发：\n"
+        "2026-10-26 09:30 交周报\n\n"
+        "3 新建 · 0 返回"
+    )
+
+
 def handle_command(conn, text, chat_id):
     text = text.strip()
     page = get_page(chat_id, conn=conn)
@@ -798,17 +939,33 @@ def handle_command(conn, text, chat_id):
 
     # -------- 创建待办 --------
 
-    if text.startswith(("添加待办", "新建待办")) and not re.match(
-        r"^添加待办\s+\d{4}-\d{2}-\d{2}\s+"
-        r"\d{2}:\d{2}\s+.+$",
-        text,
-        re.DOTALL,
-    ):
-        return (
-            "😅 格式差一点\n\n"
-            "添加待办 2026-10-26 09:30 交周报\n\n"
-            "3 重填 · 0 返回"
+    if text.startswith(("添加待办", "新建待办")):
+        # 先尝试宽松解析：前缀 + 日期 + 任意冒号/点号 + 事项
+        prefix_match = re.match(
+            r"^(?:添加待办|新建待办)\s+"
+            r"(\d{4}-\d{2}-\d{2})\s+"
+            r"(\d{1,2})\s*[:：.．]\s*(\d{2})\s+(.+)$",
+            text,
+            re.DOTALL,
         )
+        if prefix_match:
+            date_text, hour, minute, title = prefix_match.groups()
+            return _add_todo(
+                conn, chat_id, date_text,
+                f"{int(hour):02d}:{minute}", title,
+            )
+
+        if not re.match(
+            r"^添加待办\s+\d{4}-\d{2}-\d{2}\s+"
+            r"\d{2}:\d{2}\s+.+$",
+            text,
+            re.DOTALL,
+        ):
+            return (
+                "😅 格式差一点\n\n"
+                "添加待办 2026-10-26 09:30 交周报\n\n"
+                "3 重填 · 0 返回"
+            )
 
     match = re.match(
         r"^添加待办\s+(\d{4}-\d{2}-\d{2})\s+"
@@ -819,51 +976,7 @@ def handle_command(conn, text, chat_id):
 
     if match:
         date_text, time_text, title = match.groups()
-        title = title.strip()
-
-        if not title:
-            return "😅 待办得写点内容\n\n3 重填 · 0 返回"
-
-        if len(title) > 200:
-            return "😅 标题太长，200 字以内\n\n3 重填 · 0 返回"
-
-        try:
-            due_local = datetime.strptime(
-                f"{date_text} {time_text}", "%Y-%m-%d %H:%M"
-            ).replace(tzinfo=LOCAL_TZ)
-        except ValueError:
-            return "😅 日期写成 2026-10-26 09:30 这样\n\n3 重填 · 0 返回"
-
-        if due_local <= datetime.now(LOCAL_TZ):
-            return "😅 这个时间已经过去了\n\n3 重填 · 0 返回"
-
-        due_utc = due_local.astimezone(timezone.utc).isoformat(
-            timespec="seconds"
-        )
-
-        cursor = conn.execute(
-            """
-            INSERT INTO todos
-                (owner_id, title, due_at_utc, timezone,
-                 status, created_at_utc, chat_id)
-            VALUES (?, ?, ?, ?, 'pending', ?, ?)
-            """,
-            (
-                OWNER_OPEN_ID,
-                title,
-                due_utc,
-                "Asia/Shanghai",
-                now_utc(),
-                chat_id,
-            ),
-        )
-
-        return (
-            f"✅ 记下了 #{cursor.lastrowid}\n\n"
-            f"{title} · {format_due_friendly(due_utc)}\n"
-            "到点我会提醒你\n\n"
-            "2 看待办 · 0 返回"
-        )
+        return _add_todo(conn, chat_id, date_text, time_text, title)
 
     # -------- 完成或取消待办 --------
 
@@ -998,6 +1111,15 @@ def handle_command(conn, text, chat_id):
 
         return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
 
+    # -------- 自然输入：日期/今天明天 + 时间 + 事项 --------
+
+    parsed = _parse_natural_todo(
+        text, allow_time_only=page in {"todo", "todo_new"}
+    )
+    if parsed is not None:
+        date_text, time_text, title = parsed
+        return _add_todo(conn, chat_id, date_text, time_text, title)
+
     return None
 
 
@@ -1079,11 +1201,17 @@ def generate_ai_reply(chat_id, user_text):
             "role": "system",
             "content": (
                 "你是 Echo-Mate Personal Assistant，"
-                "请使用简体中文回答，表达自然、清晰、简洁。"
-                "你不能直接执行服务器命令，也不能声称已经完成"
-                "实际未执行的操作。"
-                "管理记忆请提示用户使用“记住：内容”；"
-                "管理待办请提示用户使用机器人支持的待办命令。"
+                "请使用简体中文回答，表达自然、清晰、简洁。\n\n"
+                "重要限制：你没有添加、查询、修改、删除待办或记忆的"
+                "能力，也没有读取数据库的能力。\n"
+                "当用户想管理待办或记忆时，绝对不要假装已经完成，"
+                "不要编造任何待办列表、编号或记忆内容。\n"
+                "只回复一句引导语：\n"
+                "- 添加待办：添加待办 2026-10-26 09:30 事项\n"
+                "- 查看待办：我的待办\n"
+                "- 保存记忆：记住：内容\n"
+                "- 查看记忆：列出记忆\n"
+                "你不能声称已经完成任何实际未执行的操作。"
             ),
         },
         *history,
@@ -1374,6 +1502,9 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
         return
     finally:
         conn.close()
+
+    if reply is None:
+        reply = todo_hint_reply(user_text)
 
     if reply is None:
         reply = generate_ai_reply(message.chat_id, user_text)

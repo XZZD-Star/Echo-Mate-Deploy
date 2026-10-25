@@ -54,6 +54,23 @@ def format_due(utc_text):
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+def format_due_friendly(utc_text):
+    """今天/明天/后天 + HH:MM，更远的用 MM-DD HH:MM。"""
+    dt = datetime.fromisoformat(utc_text).astimezone(LOCAL_TZ)
+    delta = (dt.date() - datetime.now(LOCAL_TZ).date()).days
+
+    if delta == 0:
+        day = "今天"
+    elif delta == 1:
+        day = "明天"
+    elif delta == 2:
+        day = "后天"
+    else:
+        return dt.strftime("%m-%d %H:%M")
+
+    return f"{day} {dt:%H:%M}"
+
+
 # ==================== 数据库 ====================
 
 def init_db():
@@ -138,40 +155,23 @@ def init_chat_table():
 
 def menu_text():
     return (
-        "🤖 Echo-Mate 功能菜单\n\n"
-        "1. 检查 VPS\n"
-        "2. 我的待办\n"
-        "3. 添加待办\n"
-        "4. 列出记忆\n"
-        "5. 帮助\n"
-        "6. 播报设置\n\n"
-        "可以发送数字或单独发送对应的功能指令。"
+        "Echo\n\n"
+        "1 · 状态\n"
+        "2 · 待办\n"
+        "3 · 新待办\n"
+        "4 · 记忆\n"
+        "5 · 帮助\n"
+        "6 · 播报"
     )
 
 
 def help_text():
     return (
-        "你好，我是 Echo-Mate Personal Assistant。\n\n"
-        "【记忆管理】\n"
-        "记住：Echo-Mate 已完成 VPS 部署\n"
-        "查记忆：VPS 部署\n"
-        "列出记忆\n"
-        "删除记忆 1\n\n"
-        "【待办管理】\n"
-        "添加待办 2026-10-18 15:00 检查 VPS\n"
-        "我的待办\n"
-        "完成待办 1\n"
-        "取消待办 1\n\n"
-        "待办时间采用北京时间（Asia/Shanghai）。\n"
-        "到期后机器人会通过飞书发送提醒。\n\n"
-        "【主动播报】\n"
-        "播报设置\n"
-        "静音 23:00 08:00\n"
-        "关闭静音\n"
-        "关闭待办播报 / 开启待办播报\n"
-        "关闭监控播报 / 开启监控播报\n"
-        "播报记录\n\n"
-        "桌宠停在桌宠页面且空闲时才会开口播报。"
+        "Echo 能做什么\n\n"
+        "添加待办 2026-10-25 15:00 检查 VPS\n"
+        "记住：xxx　查记忆 xxx\n"
+        "静音 23:00 08:00\n\n"
+        "发 6 看播报，发 1 看状态"
     )
 
 
@@ -192,43 +192,18 @@ def vps_status_text():
         seconds=max(0, int(time.time() - psutil.boot_time()))
     )
     uptime_text = (
-        f"{uptime.days}天"
-        f"{uptime.seconds // 3600}小时"
-        f"{(uptime.seconds % 3600) // 60}分钟"
+        f"{uptime.days} 天"
+        if uptime.days
+        else f"{uptime.seconds // 3600} 小时"
     )
 
     services = [
-        ("echomate-server.service", "Echo-Mate Server"),
-        ("echomate-feishu-bot.service", "飞书机器人"),
-        ("echomate-monitor.service", "VPS 监控"),
+        ("echomate-server.service", "语音"),
+        ("echomate-feishu-bot.service", "飞书"),
+        ("echomate-monitor.service", "监控"),
     ]
 
-    lines = [
-        "🖥 VPS 实时状态报告",
-        f"主机：{os.uname().nodename}",
-        f"报告时间（北京时间）：{current:%Y-%m-%d %H:%M:%S}",
-        f"系统最近启动：{boot:%Y-%m-%d %H:%M:%S}",
-        f"运行时间：{uptime_text}",
-        "",
-        f"CPU：{cpu:.1f}%（{psutil.cpu_count()} 个逻辑核）",
-        (
-            f"内存：总计 {mem.total / 1024**3:.2f} GiB，"
-            f"可用 {mem.available / 1024**3:.2f} GiB，"
-            f"使用率 {mem.percent:.1f}%"
-        ),
-        (
-            f"Swap：已使用 {swap.used / 1024**3:.2f} / "
-            f"{swap.total / 1024**3:.2f} GiB"
-        ),
-        (
-            f"磁盘 /：剩余 {disk.free / 1024**3:.2f} / "
-            f"{disk.total / 1024**3:.2f} GiB，"
-            f"使用率 {disk.percent:.1f}%"
-        ),
-        "",
-        "关键服务状态：",
-    ]
-
+    down = []
     for unit, label in services:
         try:
             result = subprocess.run(
@@ -238,11 +213,30 @@ def vps_status_text():
                 timeout=3,
                 check=False,
             )
-            state = result.stdout.strip() or "unknown"
+            active = result.stdout.strip() == "active"
         except (OSError, subprocess.TimeoutExpired):
-            state = "检查失败"
+            active = False
 
-        lines.append(f"{label}：{state}")
+        if not active:
+            down.append(label)
+
+    if down:
+        head = "🟡 有服务掉线"
+    elif cpu > 90 or mem.available < 250 * 1024**2:
+        head = "🟡 有点忙"
+    else:
+        head = "🟢 一切正常"
+
+    lines = [
+        head,
+        "",
+        f"CPU {cpu:.0f}% · 内存 {mem.available / 1024**2:.0f}M"
+        f" · 磁盘 {disk.free / 1024**3:.0f}G",
+        f"运行 {uptime_text} · {len(services) - len(down)}/{len(services)} 服务在线",
+    ]
+
+    if down:
+        lines.append("掉线：" + "、".join(down))
 
     return "\n".join(lines)
 
@@ -266,9 +260,9 @@ def _normalize_hhmm(value):
 def _kind_label(kind):
     return {
         "todo": "待办",
-        "alert": "监控告警",
-        "recovery": "监控恢复",
-        "manual": "手动测试",
+        "alert": "告警",
+        "recovery": "恢复",
+        "manual": "测试",
     }.get(kind, kind)
 
 
@@ -278,20 +272,29 @@ def notify_settings_text():
         notify_store.get_setting("notify_monitor_enabled", "1") == "1"
     )
 
+    quiet = notify_store.quiet_text().replace("（北京时间）", "")
+    quiet_line = (
+        "静音 未启用" if quiet == "未启用" else f"静音 {quiet}"
+    )
+
     lines = [
-        "🔊 主动播报设置",
-        f"静音时段：{notify_store.quiet_text()}",
-        f"待办播报：{'开启' if todo_on else '关闭'}",
-        f"监控播报：{'开启' if monitor_on else '关闭'}",
-        f"待播通知：{notify_store.pending_count()} 条",
+        "🔊 播报",
         "",
-        "发送以下命令可修改：",
-        "静音 23:00 08:00",
-        "关闭静音",
-        "关闭待办播报 / 开启待办播报",
-        "关闭监控播报 / 开启监控播报",
-        "播报记录",
+        quiet_line,
+        f"待办 {'开' if todo_on else '关'}"
+        f" · 监控 {'开' if monitor_on else '关'}",
     ]
+
+    pending = notify_store.pending_count()
+    if pending:
+        lines.append(f"待播 {pending} 条")
+
+    lines.extend([
+        "",
+        "静音 23:00 08:00",
+        "关闭静音 · 播报记录",
+    ])
+
     return "\n".join(lines)
 
 
@@ -306,27 +309,24 @@ def notify_records_text(limit=10):
         "claimed": "播放中",
         "sent": "已播",
         "failed": "失败",
-        "expired": "已过期",
+        "expired": "过期",
     }
 
-    lines = [f"📢 最近 {len(rows)} 条播报记录："]
+    lines = [f"📢 最近 {len(rows)} 条"]
 
     for row in rows:
-        sent = (row["sent_at_utc"] or "").replace("T", " ")[:16]
-        acked = "已确认" if row["acked_at_utc"] else "未确认"
         status = status_label.get(row["status"], row["status"])
 
         if row["status"] == "sent":
-            tail = acked
+            mark = f"{status} {'✓' if row['acked_at_utc'] else '·'}"
         elif row["last_error"]:
-            tail = f"错误：{row['last_error'][:40]}"
+            mark = f"{status} · {row['last_error'][:24]}"
         else:
-            tail = ""
+            mark = status
 
         lines.append(
-            f"\n#{row['id']}｜{_kind_label(row['kind'])}｜{status}"
-            f"｜{sent}{('｜' + tail) if tail else ''}"
-            f"\n{row['text'][:60]}"
+            f"\n#{row['id']} · {_kind_label(row['kind'])} · {mark}"
+            f"\n{row['text'][:50]}"
         )
 
     return "\n".join(lines)
@@ -369,24 +369,23 @@ def handle_command(conn, text, chat_id):
         end = _normalize_hhmm(end_text)
 
         if start is None or end is None:
-            return "时间格式不正确，请使用 HH:MM，例如：静音 23:00 08:00"
+            return "😅 时间写成 23:00 08:00 这样"
 
         if start == end:
-            return "开始和结束时间不能相同。"
+            return "😅 开始和结束不能一样"
 
         notify_store.set_setting("notify_quiet_start", start)
         notify_store.set_setting("notify_quiet_end", end)
 
         return (
-            f"🔇 已设置静音时段：{start} - {end}（北京时间）\n"
-            "该时段内桌宠不会主动开口，飞书通知不受影响。\n"
-            "服务端最多 60 秒内生效，无需重启。"
+            f"🔇 静音 {start}–{end}\n\n"
+            "这段桌宠闭嘴，飞书照常"
         )
 
     if text in {"关闭静音", "取消静音"}:
         notify_store.set_setting("notify_quiet_start", "")
         notify_store.set_setting("notify_quiet_end", "")
-        return "🔔 已关闭静音时段，桌宠全天可播报。"
+        return "🔔 静音关掉了"
 
     match = re.match(
         r"^(关闭|开启)(待办|监控)播报$",
@@ -403,8 +402,8 @@ def handle_command(conn, text, chat_id):
         )
         notify_store.set_setting(key, enabled)
 
-        state_text = "开启" if enabled == "1" else "关闭"
-        return f"✅ 已{state_text}{target}类主动播报。"
+        state_text = "开了" if enabled == "1" else "关了"
+        return f"✅ {target}播报{state_text}"
 
     if text in {"播报记录", "语音播报记录"}:
         return notify_records_text()
@@ -414,9 +413,20 @@ def handle_command(conn, text, chat_id):
 
     if text in {"添加待办", "新建待办"}:
         return (
-            "请按以下格式发送：\n"
-            "添加待办 YYYY-MM-DD HH:MM 事项内容\n"
-            "例如：添加待办 2026-10-20 15:00 检查项目"
+            "新待办这样发\n\n"
+            "添加待办 2026-10-25 15:00 检查 VPS"
+        )
+
+    # 看起来像在加待办但格式不对时，直接提示，不要落到 AI 聊天。
+    if text.startswith(("添加待办", "新建待办")) and not re.match(
+        r"^添加待办\s+\d{4}-\d{2}-\d{2}\s+"
+        r"\d{2}:\d{2}\s+.+$",
+        text,
+        re.DOTALL,
+    ):
+        return (
+            "😅 格式差一点\n\n"
+            "添加待办 2026-10-25 15:00 检查 VPS"
         )
 
     match = re.match(
@@ -431,10 +441,10 @@ def handle_command(conn, text, chat_id):
         title = title.strip()
 
         if not title:
-            return "待办标题不能为空。"
+            return "😅 待办得写点内容"
 
         if len(title) > 200:
-            return "待办标题最多 200 个字符。"
+            return "😅 标题太长，200 字以内"
 
         try:
             due_local = datetime.strptime(
@@ -442,13 +452,10 @@ def handle_command(conn, text, chat_id):
                 "%Y-%m-%d %H:%M",
             ).replace(tzinfo=LOCAL_TZ)
         except ValueError:
-            return (
-                "日期或时间格式不正确。\n"
-                "正确示例：添加待办 2026-10-18 15:00 检查 VPS"
-            )
+            return "😅 日期写成 2026-10-25 15:00 这样"
 
         if due_local <= datetime.now(LOCAL_TZ):
-            return "截止时间必须晚于当前时间，请重新设置。"
+            return "😅 这个时间已经过去了"
 
         due_utc = due_local.astimezone(timezone.utc).isoformat(
             timespec="seconds"
@@ -472,10 +479,9 @@ def handle_command(conn, text, chat_id):
         )
 
         return (
-            f"✅ 待办创建成功，编号 #{cursor.lastrowid}\n"
-            f"事项：{title}\n"
-            f"时间：{due_local.strftime('%Y-%m-%d %H:%M')}\n"
-            "到期后将通过飞书提醒你。"
+            f"✅ 记下了 #{cursor.lastrowid}\n\n"
+            f"{title} · {format_due_friendly(due_utc)}\n"
+            "到点提醒你"
         )
 
     # -------- 查询待办 --------
@@ -493,13 +499,14 @@ def handle_command(conn, text, chat_id):
         ).fetchall()
 
         if not rows:
-            return "目前没有未完成的待办。"
+            return "📋 空空的，没有待办"
 
-        lines = ["📋 未完成的待办（最多显示 20 条）："]
+        lines = [f"📋 {len(rows)} 件事"]
 
         for todo_id, title, due_utc in rows:
             lines.append(
-                f"\n#{todo_id}｜{format_due(due_utc)}｜{title}"
+                f"\n#{todo_id} · {format_due_friendly(due_utc)}"
+                f" · {title}"
             )
 
         return "\n".join(lines)
@@ -528,13 +535,10 @@ def handle_command(conn, text, chat_id):
 
         if cursor.rowcount:
             if action == "完成待办":
-                return f"✅ 待办 #{todo_id} 已标记为完成。"
-            return f"✅ 待办 #{todo_id} 已取消。"
+                return f"✅ #{todo_id} 完成"
+            return f"✅ #{todo_id} 取消"
 
-        return (
-            f"没有找到编号为 #{todo_id} 的未完成待办。"
-            "它可能不存在，或已经完成、取消。"
-        )
+        return f"😅 没有 #{todo_id} 这个待办"
 
     # -------- 保存记忆 --------
 
@@ -548,10 +552,10 @@ def handle_command(conn, text, chat_id):
         content = match.group(1).strip()
 
         if not content:
-            return "记忆内容不能为空。"
+            return "😅 要记的内容是空的"
 
         if len(content) > 2000:
-            return "单条记忆最多 2000 个字符，请缩短后重试。"
+            return "😅 太长了，2000 字以内"
 
         cursor = conn.execute(
             """
@@ -562,8 +566,8 @@ def handle_command(conn, text, chat_id):
         )
 
         return (
-            f"✅ 记忆已保存，编号 #{cursor.lastrowid}。\n"
-            f"内容：{content[:150]}"
+            f"✅ 记下了 #{cursor.lastrowid}\n\n"
+            f"{content[:150]}"
         )
 
     # -------- 搜索记忆 --------
@@ -589,11 +593,11 @@ def handle_command(conn, text, chat_id):
         ).fetchall()
 
         if not rows:
-            return f"没有找到包含“{keyword}”的记忆。"
+            return f"😅 没有找到“{keyword}”"
 
-        lines = [f"🔎 找到 {len(rows)} 条相关记忆："]
+        lines = [f"🔎 {len(rows)} 条"]
         lines.extend(
-            f"\n#{row[0]}：{row[1][:180]}"
+            f"\n#{row[0]} · {row[1][:180]}"
             for row in rows
         )
         return "\n".join(lines)
@@ -613,11 +617,11 @@ def handle_command(conn, text, chat_id):
         ).fetchall()
 
         if not rows:
-            return "目前还没有保存任何记忆。"
+            return "📚 还没有记忆"
 
-        lines = ["📚 最近的记忆（最多 10 条）："]
+        lines = [f"📚 最近 {len(rows)} 条"]
         lines.extend(
-            f"\n#{row[0]}：{row[1][:180]}"
+            f"\n#{row[0]} · {row[1][:180]}"
             for row in rows
         )
         return "\n".join(lines)
@@ -641,9 +645,9 @@ def handle_command(conn, text, chat_id):
         )
 
         if cursor.rowcount:
-            return f"✅ 记忆 #{memory_id} 已删除。"
+            return f"✅ #{memory_id} 删掉了"
 
-        return f"没有找到编号为 #{memory_id} 的记忆。"
+        return f"😅 没有 #{memory_id}"
 
     return None
 
@@ -695,10 +699,10 @@ if QWEN_API_KEY:
 def generate_ai_reply(chat_id, user_text):
     """使用 Qwen 回复普通聊天，并保存近期上下文。"""
     if qwen_client is None:
-        return "AI 服务尚未配置，请检查服务端的百炼 API 配置。"
+        return "😅 AI 还没配好"
 
     if len(user_text) > 4000:
-        return "这条消息有些长，请控制在 4000 个字符以内。"
+        return "😅 消息太长了，4000 字以内"
 
     # 先读取历史，再关闭数据库连接，避免网络请求期间占用数据库。
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -746,7 +750,7 @@ def generate_ai_reply(chat_id, user_text):
 
         reply = response.choices[0].message.content
         if not isinstance(reply, str) or not reply.strip():
-            return "AI 暂时没有生成有效回复，请换个方式提问。"
+            return "😅 这次没想出来，换个说法试试"
 
         reply = reply.strip()
 
@@ -756,7 +760,7 @@ def generate_ai_reply(chat_id, user_text):
             f"[Qwen] 请求失败，异常类型={type(exc).__name__}",
             flush=True,
         )
-        return "抱歉，AI 服务暂时没有成功响应，请稍后再试。"
+        return "😅 AI 卡了一下，稍后再试"
 
     # 只有成功获得回答后才保存本轮聊天。
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -885,14 +889,11 @@ def reminder_loop():
                 if cursor.rowcount == 0:
                     continue
 
-                due_display = format_due(due_utc)
+                due_display = format_due_friendly(due_utc)
                 content = (
-                    f"⏰ 待办到期提醒\n"
-                    f"编号：#{todo_id}\n"
-                    f"事项：{title}\n"
-                    f"计划时间：{due_display}\n\n"
-                    f"完成后发送：完成待办 {todo_id}\n"
-                    f"取消任务发送：取消待办 {todo_id}"
+                    f"⏰ {title}\n\n"
+                    f"{due_display} · #{todo_id}\n"
+                    f"完成 → 完成待办 {todo_id}"
                 )
 
                 try:

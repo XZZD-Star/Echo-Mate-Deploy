@@ -1,5 +1,6 @@
 import argparse
 import sqlite3
+from contextlib import contextmanager
 import subprocess
 import time
 from datetime import datetime, timezone, timedelta
@@ -110,10 +111,19 @@ def parse_time(value):
     return datetime.fromisoformat(value)
 
 
+@contextmanager
 def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    """连接用完必须关闭，否则 WAL 下会累积句柄并长期持有写锁。"""
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -203,8 +213,14 @@ def spoken_alert_text(title, details, recovery=False):
         }.get(service, service)
         label = friendly
 
+    metric = label.endswith(("不足", "过高", "过低", "已满"))
+
     if recovery:
-        return f"VPS 的{label}已恢复。"
+        return f"{label}，恢复正常。" if metric else f"{label}好了。"
+
+    # 指标类标题本身已含“不足/过高”，不再拼“异常”。
+    if metric:
+        return f"注意，{label}。"
 
     return f"注意，VPS 的{label}异常。"
 
@@ -265,16 +281,23 @@ def evaluate(key, title, abnormal, details,
             )
 
             if not state["active"] or cooldown_passed:
-                if state["active"]:
-                    heading = "⚠️ VPS 异常仍在持续"
-                else:
-                    heading = "🚨 VPS 异常告警"
+                short_title = title.split("：", 1)[-1]
+                friendly = {
+                    "echomate-server.service": "语音服务",
+                    "echomate-feishu-bot.service": "飞书机器人",
+                    "echomate-monitor.service": "监控服务",
+                }.get(short_title, short_title)
+
+                heading = (
+                    f"⚠️ {friendly}还没好"
+                    if state["active"]
+                    else f"🚨 {friendly}掉线"
+                )
 
                 message = (
-                    f"{heading}\n"
-                    f"监控项：{title}\n"
-                    f"详情：{details}\n"
-                    f"时间：{current.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"{heading}\n\n"
+                    f"{details}\n"
+                    f"{current.astimezone().strftime('%H:%M')}"
                 )
 
                 if send_feishu(message):
@@ -290,11 +313,16 @@ def evaluate(key, title, abnormal, details,
         state["first_bad"] = None
 
         if state["active"]:
+            short_title = title.split("：", 1)[-1]
+            friendly = {
+                "echomate-server.service": "语音服务",
+                "echomate-feishu-bot.service": "飞书机器人",
+                "echomate-monitor.service": "监控服务",
+            }.get(short_title, short_title)
+
             message = (
-                f"✅ VPS 异常已恢复\n"
-                f"监控项：{title}\n"
-                f"当前状态：{details}\n"
-                f"时间：{current.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"✅ {friendly}回来了\n\n"
+                f"{current.astimezone().strftime('%H:%M')}"
             )
 
             if send_feishu(message):
@@ -438,41 +466,30 @@ def send_startup_report_once():
         f"{(uptime.seconds % 3600) // 60}分钟"
     )
 
-    service_lines = []
-    for unit, label in [
-        ("echomate-server.service", "Echo-Mate Server"),
-        ("echomate-feishu-bot.service", "飞书机器人"),
-        ("echomate-monitor.service", "VPS 监控"),
-    ]:
-        active = service_is_active(unit)
-        service_lines.append(
-            f"{label}：{'运行正常' if active else '异常/未运行'}"
-        )
+    services = [
+        ("echomate-server.service", "语音"),
+        ("echomate-feishu-bot.service", "飞书"),
+        ("echomate-monitor.service", "监控"),
+    ]
+
+    down = [label for unit, label in services if not service_is_active(unit)]
 
     # 首次启用时发送基线报告；以后只在新的系统启动周期报告。
     heading = (
-        "📊 VPS 监控已启用，当前状态基线"
+        "📊 监控上线了"
         if row is None
-        else "🟢 VPS 已启动，本次开机状态报告"
+        else "🟢 开机了"
     )
 
     report = (
-        f"{heading}\n"
-        f"主机：{os.uname().nodename}\n"
-        f"报告时间（北京时间）：{current:%Y-%m-%d %H:%M:%S}\n"
-        f"系统启动时间：{boot:%Y-%m-%d %H:%M:%S}\n"
-        f"运行时间：{uptime_text}\n\n"
-        f"CPU：{cpu:.1f}%（{psutil.cpu_count()} 个逻辑核）\n"
-        f"内存：总计 {mem.total / 1024**3:.2f} GiB，"
-        f"可用 {mem.available / 1024**3:.2f} GiB，"
-        f"使用率 {mem.percent:.1f}%\n"
-        f"Swap：已使用 {swap.used / 1024**3:.2f} / "
-        f"{swap.total / 1024**3:.2f} GiB\n"
-        f"磁盘 /：剩余 {disk.free / 1024**3:.2f} / "
-        f"{disk.total / 1024**3:.2f} GiB，"
-        f"使用率 {disk.percent:.1f}%\n\n"
-        "关键服务状态：\n" + "\n".join(service_lines)
+        f"{heading}\n\n"
+        f"CPU {cpu:.0f}% · 内存 {mem.available / 1024**2:.0f}M"
+        f" · 磁盘 {disk.free / 1024**3:.0f}G\n"
+        f"运行 {uptime_text} · {len(services) - len(down)}/{len(services)} 服务在线"
     )
+
+    if down:
+        report += "\n掉线：" + "、".join(down)
 
     # 发送失败时不写入 Boot ID，下个检查周期会重试。
     if not send_feishu(report):
@@ -518,14 +535,13 @@ def send_startup_menu_once():
         return
 
     menu = (
-        "🤖 Echo-Mate 功能菜单\n\n"
-        "请单独发送数字，或单独发送对应文字指令：\n"
-        "1. 检查 VPS\n"
-        "2. 我的待办\n"
-        "3. 添加待办\n"
-        "4. 列出记忆\n"
-        "5. 帮助\n\n"
-        "只有整条消息匹配指令时才执行功能。"
+        "Echo\n\n"
+        "1 · 状态\n"
+        "2 · 待办\n"
+        "3 · 新待办\n"
+        "4 · 记忆\n"
+        "5 · 帮助\n"
+        "6 · 播报"
     )
 
     if not send_feishu(menu):

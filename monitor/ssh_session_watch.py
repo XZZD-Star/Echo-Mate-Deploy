@@ -20,14 +20,13 @@ SERVICES = [
 ]
 
 MENU = (
-    "🤖 Echo-Mate 功能菜单\n\n"
-    "请单独发送数字，或单独发送对应文字指令：\n"
-    "1. 检查 VPS\n"
-    "2. 我的待办\n"
-    "3. 添加待办\n"
-    "4. 列出记忆\n"
-    "5. 帮助\n\n"
-    "只有整条消息匹配指令时才执行功能。"
+    "Echo\n\n"
+    "1 · 状态\n"
+    "2 · 待办\n"
+    "3 · 新待办\n"
+    "4 · 记忆\n"
+    "5 · 帮助\n"
+    "6 · 播报"
 )
 
 
@@ -119,42 +118,40 @@ def make_connect_message():
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
 
-    service_lines = []
-    for unit, label in SERVICES:
-        active = monitor.service_is_active(unit)
-        service_lines.append(
-            f"{label}：{'运行正常' if active else '异常/未运行'}"
-        )
+    down = [
+        label for unit, label in SERVICES
+        if not monitor.service_is_active(unit)
+    ]
 
-    report = (
-        "🟢 检测到 SSH 终端连接\n"
-        f"主机：{os.uname().nodename}\n"
-        f"报告时间（北京时间）：{now:%Y-%m-%d %H:%M:%S}\n"
-        f"系统启动时间：{boot:%Y-%m-%d %H:%M:%S}\n"
-        f"运行时间：{days}天{hours}小时{minutes}分钟\n\n"
-        f"CPU：{cpu:.1f}%（{psutil.cpu_count()} 个逻辑核）\n"
-        f"内存：总计 {mem.total / 1024**3:.2f} GiB，"
-        f"可用 {mem.available / 1024**3:.2f} GiB，"
-        f"使用率 {mem.percent:.1f}%\n"
-        f"Swap：已使用 {swap.used / 1024**3:.2f} / "
-        f"{swap.total / 1024**3:.2f} GiB\n"
-        f"磁盘 /：剩余 {disk.free / 1024**3:.2f} / "
-        f"{disk.total / 1024**3:.2f} GiB，"
-        f"使用率 {disk.percent:.1f}%\n\n"
-        "关键服务状态：\n"
-        + "\n".join(service_lines)
+    if down:
+        head = "🟡 连上了，有服务掉线"
+    elif cpu > 90 or mem.available < 250 * 1024**2:
+        head = "🟡 连上了，有点忙"
+    else:
+        head = "🟢 连上了"
+
+    uptime = (
+        f"{days} 天" if days else f"{hours} 小时"
     )
 
-    return report + "\n\n" + MENU
+    report = (
+        f"{head}\n\n"
+        f"CPU {cpu:.0f}% · 内存 {mem.available / 1024**2:.0f}M"
+        f" · 磁盘 {disk.free / 1024**3:.0f}G\n"
+        f"运行 {uptime} · {len(SERVICES) - len(down)}/{len(SERVICES)} 服务在线"
+    )
+
+    if down:
+        report += "\n掉线：" + "、".join(down)
+
+    return report
 
 
 def send_disconnect_message():
     now = datetime.now(LOCAL_TZ)
     message = (
-        "🔴 所有 SSH 终端已断开\n"
-        f"检测时间（北京时间）：{now:%Y-%m-%d %H:%M:%S}\n"
-        "当前没有检测到活动的 pts/* 终端。\n"
-        "注意：这不代表 VPS 已关机，后台服务仍可继续运行。"
+        "🔴 断开 · 后台还在跑\n\n"
+        f"{now:%H:%M}"
     )
     return monitor.send_feishu(message)
 

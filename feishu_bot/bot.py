@@ -769,7 +769,7 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
 
 
 def _parse_natural_todo(text, allow_time_only=False):
-    """解析自然输入，返回 (日期, 时间, 标题) 或 None。
+    """解析自然输入，返回 (日期, 时间, 标题)、("past", None, None, None) 或 None。
 
     支持：
       2026-10-25 14：54 呼叫林梦雨   （全角/半角/点号均可）
@@ -819,7 +819,7 @@ def _parse_natural_todo(text, allow_time_only=False):
                 second=0, microsecond=0,
             )
             if candidate <= now:
-                return None
+                return "past", None, None, None
             return (
                 target.strftime("%Y-%m-%d"),
                 f"{int(hour):02d}:{minute}",
@@ -1183,6 +1183,13 @@ def handle_command(conn, text, chat_id):
 
     if page == "todo_new":
         parsed = _parse_natural_todo(text, allow_time_only=True)
+        if parsed and parsed[0] == "past":
+            return (
+                "😅 这个时间不能早于当前时间\n\n"
+                f"现在是 {datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M}\n"
+                "请填写之后的时间\n\n"
+                "3 重填 · 0 返回"
+            )
         if parsed is not None:
             date_text, time_text, title = parsed
             return _add_todo(conn, chat_id, date_text, time_text, title)

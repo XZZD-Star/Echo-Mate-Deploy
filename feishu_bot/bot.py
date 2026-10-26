@@ -728,7 +728,12 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
         return "😅 日期写成 2026-10-26 09:30 这样\n\n3 重填 · 0 返回"
 
     if due_local <= datetime.now(LOCAL_TZ):
-        return "😅 这个时间已经过去了\n\n3 重填 · 0 返回"
+        return (
+            "😅 这个时间不能早于当前时间\n\n"
+            f"现在是 {datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M}\n"
+            "请填写之后的时间\n\n"
+            "3 重填 · 0 返回"
+        )
 
     due_utc = due_local.astimezone(timezone.utc).isoformat(
         timespec="seconds"
@@ -742,6 +747,7 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
         chat_id=chat_id,
         notify_deskbot=True,
         notify_feishu=True,
+        conn=conn,
     )
 
     if result == "duplicate":
@@ -813,7 +819,7 @@ def _parse_natural_todo(text, allow_time_only=False):
                 second=0, microsecond=0,
             )
             if candidate <= now:
-                target = target + timedelta(days=1)
+                return None
             return (
                 target.strftime("%Y-%m-%d"),
                 f"{int(hour):02d}:{minute}",
@@ -831,7 +837,7 @@ def handle_command(conn, text, chat_id):
     if match:
         candidate_id = int(match.group(1))
         if echomate_store.decide_memory_candidate(
-            OWNER_OPEN_ID, candidate_id, "accept"
+            OWNER_OPEN_ID, candidate_id, "accept", conn=conn
         ):
             return f"✅ 记忆 #{candidate_id} 已确认写入"
         return f"😅 没有待确认的候选记忆 #{candidate_id}"
@@ -840,13 +846,15 @@ def handle_command(conn, text, chat_id):
     if match:
         candidate_id = int(match.group(1))
         if echomate_store.decide_memory_candidate(
-            OWNER_OPEN_ID, candidate_id, "reject"
+            OWNER_OPEN_ID, candidate_id, "reject", conn=conn
         ):
             return f"✅ 已取消候选记忆 #{candidate_id}"
         return f"😅 没有待确认的候选记忆 #{candidate_id}"
 
     if text in {"记忆候选", "待确认记忆"}:
-        candidates = echomate_store.list_memory_candidates(OWNER_OPEN_ID, 10)
+        candidates = echomate_store.list_memory_candidates(
+            OWNER_OPEN_ID, 10, conn=conn
+        )
         if not candidates:
             return "📚 没有待确认的候选记忆"
         lines = [f"📝 待确认候选 {len(candidates)} 条", ""]
@@ -1058,7 +1066,7 @@ def handle_command(conn, text, chat_id):
             return "😅 太长了，2000 字以内\n\n4 看记忆 · 0 返回"
 
         candidate_id, result = echomate_store.enqueue_memory_candidate(
-            OWNER_OPEN_ID, content, source="feishu"
+            OWNER_OPEN_ID, content, source="feishu", conn=conn
         )
         if result == "created":
             return (
@@ -1121,7 +1129,9 @@ def handle_command(conn, text, chat_id):
         if not row:
             return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
 
-        if not echomate_store.delete_memory(OWNER_OPEN_ID, memory_id):
+        if not echomate_store.delete_memory(
+            OWNER_OPEN_ID, memory_id, conn=conn
+        ):
             return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
         preview = row[0][:40]
         return (
@@ -1159,7 +1169,9 @@ def handle_command(conn, text, chat_id):
             set_page(chat_id, "memory", conn=conn)
             return "📚 本来就没有记忆\n\n0 返回"
 
-        removed = echomate_store.clear_memories(OWNER_OPEN_ID)
+        removed = echomate_store.clear_memories(
+            OWNER_OPEN_ID, conn=conn
+        )
         set_page(chat_id, "memory", conn=conn)
         return (
             f"✅ 清空了 {removed} 条记忆\n\n"
@@ -2335,7 +2347,7 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
             f"[数据库] 处理失败：{type(exc).__name__}",
             flush=True,
         )
-        return
+        reply = "😅 这条消息保存失败，请稍后重试。\n\n不会重复创建，直接重发即可。"
     finally:
         conn.close()
 

@@ -160,7 +160,8 @@ def memory_context(owner_id, limit=50):
     return result
 
 
-def enqueue_memory_candidate(owner_id, content, source="ai_chat", category=None):
+def enqueue_memory_candidate(owner_id, content, source="ai_chat", category=None,
+                             conn=None):
     content = (content or "").strip()
     if not content:
         return None, "empty"
@@ -168,87 +169,122 @@ def enqueue_memory_candidate(owner_id, content, source="ai_chat", category=None)
         return None, "too_long"
 
     category = category or detect_category(content)
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT id, content FROM memory_candidates "
-            "WHERE owner_id = ? AND status = 'pending'",
-            (owner_id,),
-        ).fetchall()
-        key = _normalize(content)
-        for row in rows:
-            if _normalize(row["content"]) == key:
-                return row["id"], "duplicate"
-
-        cursor = conn.execute(
-            """
-            INSERT INTO memory_candidates
-                (owner_id, category, content, source, created_at_utc)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (owner_id, category, content, source, now_utc()),
+    if conn is not None:
+        return _enqueue_memory_candidate(conn, owner_id, content, source, category)
+    with connect() as owned_conn:
+        return _enqueue_memory_candidate(
+            owned_conn, owner_id, content, source, category
         )
-        return cursor.lastrowid, "created"
 
 
-def list_memory_candidates(owner_id, limit=10):
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, category, content, source, created_at_utc
-            FROM memory_candidates
-            WHERE owner_id = ? AND status = 'pending'
-            ORDER BY id ASC LIMIT ?
-            """,
-            (owner_id, int(limit)),
-        ).fetchall()
+def _enqueue_memory_candidate(conn, owner_id, content, source, category):
+    rows = conn.execute(
+        "SELECT id, content FROM memory_candidates "
+        "WHERE owner_id = ? AND status = 'pending'",
+        (owner_id,),
+    ).fetchall()
+    key = _normalize(content)
+    for row in rows:
+        if _normalize(row["content"]) == key:
+            return row["id"], "duplicate"
+
+    cursor = conn.execute(
+        """
+        INSERT INTO memory_candidates
+            (owner_id, category, content, source, created_at_utc)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (owner_id, category, content, source, now_utc()),
+    )
+    return cursor.lastrowid, "created"
+
+
+def list_memory_candidates(owner_id, limit=10, conn=None):
+    if conn is not None:
+        rows = _list_memory_candidates(conn, owner_id, limit)
+    else:
+        with connect() as owned_conn:
+            rows = _list_memory_candidates(owned_conn, owner_id, limit)
     return [dict(r) for r in rows]
 
 
-def decide_memory_candidate(owner_id, candidate_id, decision):
+def _list_memory_candidates(conn, owner_id, limit):
+    return conn.execute(
+        """
+        SELECT id, category, content, source, created_at_utc
+        FROM memory_candidates
+        WHERE owner_id = ? AND status = 'pending'
+        ORDER BY id ASC LIMIT ?
+        """,
+        (owner_id, int(limit)),
+    ).fetchall()
+
+
+def decide_memory_candidate(owner_id, candidate_id, decision, conn=None):
     if decision not in ("accept", "reject"):
         return False
-    with connect() as conn:
-        row = conn.execute(
-            """
-            SELECT id, category, content, source FROM memory_candidates
-            WHERE id = ? AND owner_id = ? AND status = 'pending'
-            """,
-            (int(candidate_id), owner_id),
-        ).fetchone()
-        if not row:
-            return False
-
-        if decision == "accept":
-            conn.execute(
-                """
-                INSERT INTO memories
-                    (owner_id, content, created_at, category, source, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (owner_id, row["content"], now_utc(), row["category"],
-                 row["source"], now_utc()),
-            )
-        conn.execute(
-            "UPDATE memory_candidates SET status = ?, decided_at_utc = ? WHERE id = ?",
-            ("accepted" if decision == "accept" else "rejected",
-             now_utc(), int(candidate_id)),
+    if conn is not None:
+        return _decide_memory_candidate(conn, owner_id, candidate_id, decision)
+    with connect() as owned_conn:
+        return _decide_memory_candidate(
+            owned_conn, owner_id, candidate_id, decision
         )
+
+
+def _decide_memory_candidate(conn, owner_id, candidate_id, decision):
+    row = conn.execute(
+        """
+        SELECT id, category, content, source FROM memory_candidates
+        WHERE id = ? AND owner_id = ? AND status = 'pending'
+        """,
+        (int(candidate_id), owner_id),
+    ).fetchone()
+    if not row:
+        return False
+
+    if decision == "accept":
+        conn.execute(
+            """
+            INSERT INTO memories
+                (owner_id, content, created_at, category, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (owner_id, row["content"], now_utc(), row["category"],
+             row["source"], now_utc()),
+        )
+    conn.execute(
+        "UPDATE memory_candidates SET status = ?, decided_at_utc = ? WHERE id = ?",
+        ("accepted" if decision == "accept" else "rejected",
+         now_utc(), int(candidate_id)),
+    )
     return True
 
 
-def delete_memory(owner_id, memory_id):
-    with connect() as conn:
-        cursor = conn.execute(
-            "DELETE FROM memories WHERE id = ? AND owner_id = ?",
-            (int(memory_id), owner_id),
-        )
-        return cursor.rowcount > 0
+def delete_memory(owner_id, memory_id, conn=None):
+    if conn is not None:
+        return _delete_memory(conn, owner_id, memory_id)
+    with connect() as owned_conn:
+        return _delete_memory(owned_conn, owner_id, memory_id)
 
 
-def clear_memories(owner_id):
-    with connect() as conn:
-        cursor = conn.execute("DELETE FROM memories WHERE owner_id = ?", (owner_id,))
-        return cursor.rowcount
+def _delete_memory(conn, owner_id, memory_id):
+    cursor = conn.execute(
+        "DELETE FROM memories WHERE id = ? AND owner_id = ?",
+        (int(memory_id), owner_id),
+    )
+    return cursor.rowcount > 0
+
+
+def clear_memories(owner_id, conn=None):
+    if conn is not None:
+        return _clear_memories(conn, owner_id)
+    with connect() as owned_conn:
+        return _clear_memories(owned_conn, owner_id)
+
+
+def _clear_memories(conn, owner_id):
+    cursor = conn.execute("DELETE FROM memories WHERE owner_id = ?", (owner_id,))
+    return cursor.rowcount
 
 
 def _parse_due(due_text):
@@ -266,7 +302,7 @@ def _parse_due(due_text):
 
 def create_todo(owner_id, title, due_at_utc, source="feishu",
                 chat_id="", dedupe_key=None, notify_deskbot=True,
-                notify_feishu=True):
+                notify_feishu=True, conn=None):
     title = (title or "").strip()
     if not title:
         return None, "empty"
@@ -284,58 +320,84 @@ def create_todo(owner_id, title, due_at_utc, source="feishu",
         raw = f"{owner_id}|{title}|{due_text}".encode("utf-8")
         dedupe_key = "todo:" + hashlib.sha256(raw).hexdigest()[:24]
 
-    with connect() as conn:
-        row = conn.execute(
-            """
-            SELECT id FROM todos
-            WHERE owner_id = ? AND dedupe_key = ?
-              AND status = 'pending'
-            """,
-            (owner_id, dedupe_key),
-        ).fetchone()
-        if row:
-            return row["id"], "duplicate"
-
-        cursor = conn.execute(
-            """
-            INSERT INTO todos
-                (owner_id, title, due_at_utc, timezone, status,
-                 created_at_utc, chat_id, source, dedupe_key,
-                 notify_deskbot, notify_feishu)
-            VALUES (?, ?, ?, 'Asia/Shanghai', 'pending',
-                    ?, ?, ?, ?, ?, ?)
-            """,
-            (owner_id, title, due_text, now_utc(), chat_id or "",
-             source, dedupe_key, int(bool(notify_deskbot)),
-             int(bool(notify_feishu))),
+    if conn is not None:
+        return _create_todo(
+            conn, owner_id, title, due_text, source, chat_id, dedupe_key,
+            notify_deskbot, notify_feishu
         )
-        return cursor.lastrowid, "created"
+    with connect() as owned_conn:
+        return _create_todo(
+            owned_conn, owner_id, title, due_text, source, chat_id, dedupe_key,
+            notify_deskbot, notify_feishu
+        )
 
 
-def list_todos(owner_id, include_done=False, limit=50):
+def _create_todo(conn, owner_id, title, due_text, source, chat_id, dedupe_key,
+                 notify_deskbot, notify_feishu):
+    row = conn.execute(
+        """
+        SELECT id FROM todos
+        WHERE owner_id = ? AND dedupe_key = ?
+          AND status = 'pending'
+        """,
+        (owner_id, dedupe_key),
+    ).fetchone()
+    if row:
+        return row["id"], "duplicate"
+
+    cursor = conn.execute(
+        """
+        INSERT INTO todos
+            (owner_id, title, due_at_utc, timezone, status,
+             created_at_utc, chat_id, source, dedupe_key,
+             notify_deskbot, notify_feishu)
+        VALUES (?, ?, ?, 'Asia/Shanghai', 'pending',
+                ?, ?, ?, ?, ?, ?)
+        """,
+        (owner_id, title, due_text, now_utc(), chat_id or "",
+         source, dedupe_key, int(bool(notify_deskbot)),
+         int(bool(notify_feishu))),
+    )
+    return cursor.lastrowid, "created"
+
+
+def list_todos(owner_id, include_done=False, limit=50, conn=None):
     where = "" if include_done else "AND status = 'pending'"
-    with connect() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, title, due_at_utc, status, source, chat_id,
-                   notify_deskbot, notify_feishu
-            FROM todos WHERE owner_id = ? {where}
-            ORDER BY due_at_utc ASC LIMIT ?
-            """,
-            (owner_id, int(limit)),
-        ).fetchall()
+    if conn is not None:
+        rows = _list_todos(conn, owner_id, where, limit)
+    else:
+        with connect() as owned_conn:
+            rows = _list_todos(owned_conn, owner_id, where, limit)
     return [dict(r) for r in rows]
 
 
-def set_todo_status(owner_id, todo_id, status):
+def _list_todos(conn, owner_id, where, limit):
+    return conn.execute(
+        f"""
+        SELECT id, title, due_at_utc, status, source, chat_id,
+               notify_deskbot, notify_feishu
+        FROM todos WHERE owner_id = ? {where}
+        ORDER BY due_at_utc ASC LIMIT ?
+        """,
+        (owner_id, int(limit)),
+    ).fetchall()
+
+
+def set_todo_status(owner_id, todo_id, status, conn=None):
     if status not in ("pending", "completed", "cancelled"):
         return False
-    with connect() as conn:
-        cursor = conn.execute(
-            "UPDATE todos SET status = ? WHERE id = ? AND owner_id = ?",
-            (status, int(todo_id), owner_id),
-        )
-        return cursor.rowcount > 0
+    if conn is not None:
+        return _set_todo_status(conn, owner_id, todo_id, status)
+    with connect() as owned_conn:
+        return _set_todo_status(owned_conn, owner_id, todo_id, status)
+
+
+def _set_todo_status(conn, owner_id, todo_id, status):
+    cursor = conn.execute(
+        "UPDATE todos SET status = ? WHERE id = ? AND owner_id = ?",
+        (status, int(todo_id), owner_id),
+    )
+    return cursor.rowcount > 0
 
 
 def materialize_due_reminders():

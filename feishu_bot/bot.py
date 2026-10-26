@@ -22,6 +22,7 @@ from echomate_credentials import credential
 # 主动播报队列：与 AIChat Server 共用同一份 SQLite，纯标准库实现。
 sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
 from tools import notify_store
+from tools import memory_store
 
 
 # ==================== 配置 ====================
@@ -846,6 +847,30 @@ def todo_hint_reply(text):
 def handle_command(conn, text, chat_id):
     text = text.strip()
     page = get_page(chat_id, conn=conn)
+
+    match = re.match(r"^确认记忆\s*#?(\d+)\s*$", text)
+    if match:
+        candidate_id = int(match.group(1))
+        if memory_store.decide_candidate(OWNER_OPEN_ID, candidate_id, "accept"):
+            return f"✅ 记忆 #{candidate_id} 已确认写入"
+        return f"😅 没有待确认的候选记忆 #{candidate_id}"
+
+    match = re.match(r"^取消记忆\s*#?(\d+)\s*$", text)
+    if match:
+        candidate_id = int(match.group(1))
+        if memory_store.decide_candidate(OWNER_OPEN_ID, candidate_id, "reject"):
+            return f"✅ 已取消候选记忆 #{candidate_id}"
+        return f"😅 没有待确认的候选记忆 #{candidate_id}"
+
+    if text in {"记忆候选", "待确认记忆"}:
+        candidates = memory_store.list_candidates(OWNER_OPEN_ID, 10)
+        if not candidates:
+            return "📚 没有待确认的候选记忆"
+        lines = [f"📝 待确认候选 {len(candidates)} 条", ""]
+        for item in candidates:
+            lines.append(f"#{item['id']} · {item['content'][:60]}")
+        lines.extend(["", "确认发：确认记忆 #编号", "取消发：取消记忆 #编号"])
+        return "\n".join(lines)
 
     # -------- 全局导航 --------
 
@@ -2355,6 +2380,22 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
     if reply is None:
         reply = todo_hint_reply(user_text)
+
+    if reply is None:
+        match = re.match(r"^(?:记住|保存记忆)\s*[:：]\s*(.+)$", user_text, re.DOTALL)
+        if match:
+            with db_conn() as mem_conn:
+                candidate_id, result = memory_store.enqueue_candidate(
+                    OWNER_OPEN_ID, match.group(1).strip()
+                )
+            if result == "created":
+                reply = f"📝 已生成记忆候选 #{candidate_id}\n确认请发：确认记忆 #{candidate_id}\n取消请发：取消记忆 #{candidate_id}"
+            elif result == "duplicate":
+                reply = f"已有相同候选记忆 #{candidate_id}\n确认请发：确认记忆 #{candidate_id}"
+            elif result == "too_long":
+                reply = "😅 太长了，2000 字以内"
+            else:
+                reply = "😅 要记的内容是空的"
 
     if reply is None:
         reply = generate_ai_reply(message.chat_id, user_text)

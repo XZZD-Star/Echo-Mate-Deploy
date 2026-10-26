@@ -23,6 +23,11 @@ from echomate_credentials import credential
 sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
 from tools import notify_store
 from tools import memory_store
+import echomate_store
+from services import assistant_actions
+from contextvars import ContextVar
+
+CURRENT_CHAT_ID = ContextVar("CURRENT_CHAT_ID", default="")
 
 
 # ==================== 配置 ====================
@@ -727,25 +732,28 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
         timespec="seconds"
     )
 
-    cursor = conn.execute(
-        """
-        INSERT INTO todos
-            (owner_id, title, due_at_utc, timezone,
-             status, created_at_utc, chat_id)
-        VALUES (?, ?, ?, ?, 'pending', ?, ?)
-        """,
-        (
-            OWNER_OPEN_ID,
-            title,
-            due_utc,
-            "Asia/Shanghai",
-            now_utc(),
-            chat_id,
-        ),
+    todo_id, result = echomate_store.create_todo(
+        OWNER_OPEN_ID,
+        title,
+        due_utc,
+        source="feishu",
+        chat_id=chat_id,
+        notify_deskbot=True,
+        notify_feishu=True,
     )
 
+    if result == "duplicate":
+        return (
+            f"ℹ️ 这条待办已经存在 #{todo_id}\n\n"
+            f"{title} · {format_due_friendly(due_utc)}\n\n"
+            "2 看待办 · 0 返回"
+        )
+
+    if result != "created":
+        return "😅 待办没保存成功，稍后再试\n\n3 重填 · 0 返回"
+
     return (
-        f"✅ 记下了 #{cursor.lastrowid}\n\n"
+        f"✅ 记下了 #{todo_id}\n\n"
         f"{title} · {format_due_friendly(due_utc)}\n"
         "到点我会提醒你\n\n"
         "2 看待办 · 0 返回"
@@ -851,19 +859,23 @@ def handle_command(conn, text, chat_id):
     match = re.match(r"^确认记忆\s*#?(\d+)\s*$", text)
     if match:
         candidate_id = int(match.group(1))
-        if memory_store.decide_candidate(OWNER_OPEN_ID, candidate_id, "accept"):
+        if echomate_store.decide_memory_candidate(
+            OWNER_OPEN_ID, candidate_id, "accept"
+        ):
             return f"✅ 记忆 #{candidate_id} 已确认写入"
         return f"😅 没有待确认的候选记忆 #{candidate_id}"
 
     match = re.match(r"^取消记忆\s*#?(\d+)\s*$", text)
     if match:
         candidate_id = int(match.group(1))
-        if memory_store.decide_candidate(OWNER_OPEN_ID, candidate_id, "reject"):
+        if echomate_store.decide_memory_candidate(
+            OWNER_OPEN_ID, candidate_id, "reject"
+        ):
             return f"✅ 已取消候选记忆 #{candidate_id}"
         return f"😅 没有待确认的候选记忆 #{candidate_id}"
 
     if text in {"记忆候选", "待确认记忆"}:
-        candidates = memory_store.list_candidates(OWNER_OPEN_ID, 10)
+        candidates = echomate_store.list_memory_candidates(OWNER_OPEN_ID, 10)
         if not candidates:
             return "📚 没有待确认的候选记忆"
         lines = [f"📝 待确认候选 {len(candidates)} 条", ""]
@@ -1085,19 +1097,21 @@ def handle_command(conn, text, chat_id):
         if len(content) > 2000:
             return "😅 太长了，2000 字以内\n\n4 看记忆 · 0 返回"
 
-        cursor = conn.execute(
-            """
-            INSERT INTO memories (owner_id, content, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (OWNER_OPEN_ID, content, now_utc()),
+        candidate_id, result = echomate_store.enqueue_memory_candidate(
+            OWNER_OPEN_ID, content, source="feishu"
         )
-
-        return (
-            f"✅ 记下了 #{cursor.lastrowid}\n\n"
-            f"{content[:150]}\n\n"
-            "4 看记忆 · 0 返回"
-        )
+        if result == "created":
+            return (
+                f"📝 已生成记忆候选 #{candidate_id}\n\n"
+                f"{content[:150]}\n\n"
+                f"确认发：确认记忆 #{candidate_id}\n"
+                f"取消发：取消记忆 #{candidate_id}"
+            )
+        if result == "duplicate":
+            return f"ℹ️ 已有相同候选记忆 #{candidate_id}"
+        if result == "too_long":
+            return "😅 太长了，2000 字以内"
+        return "😅 要记的内容是空的"
 
     # -------- 搜索记忆 --------
 
@@ -1147,10 +1161,8 @@ def handle_command(conn, text, chat_id):
         if not row:
             return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
 
-        conn.execute(
-            "DELETE FROM memories WHERE id = ? AND owner_id = ?",
-            (memory_id, OWNER_OPEN_ID),
-        )
+        if not echomate_store.delete_memory(OWNER_OPEN_ID, memory_id):
+            return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
         preview = row[0][:40]
         return (
             f"✅ 删掉了 #{memory_id}\n\n"
@@ -1187,12 +1199,10 @@ def handle_command(conn, text, chat_id):
             set_page(chat_id, "memory", conn=conn)
             return "📚 本来就没有记忆\n\n0 返回"
 
-        conn.execute(
-            "DELETE FROM memories WHERE owner_id = ?", (OWNER_OPEN_ID,)
-        )
+        removed = echomate_store.clear_memories(OWNER_OPEN_ID)
         set_page(chat_id, "memory", conn=conn)
         return (
-            f"✅ 清空了 {total} 条记忆\n\n"
+            f"✅ 清空了 {removed} 条记忆\n\n"
             "以后想存新的，发：记住：内容\n\n"
             "0 返回"
         )
@@ -1682,6 +1692,8 @@ CHAT_TOOLS = [
             },
         },
     },
+    assistant_actions.TODO_TOOL,
+    assistant_actions.MEMORY_TOOL,
     {
         "type": "function",
         "function": {
@@ -1867,6 +1879,49 @@ def _tool_search_memories(args):
     }
 
 
+def _tool_add_todo(args):
+    title = (args.get("title") or "").strip()
+    due_text = (args.get("due_at") or "").strip()
+    due = assistant_actions._parse_local_datetime(due_text)
+    if not title or due is None:
+        return {"ok": False, "error": "缺少待办标题或有效时间"}
+
+    todo_id, result = echomate_store.create_todo(
+        OWNER_OPEN_ID,
+        title,
+        due.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        source="feishu",
+        chat_id=CURRENT_CHAT_ID.get(),
+        notify_deskbot=True,
+        notify_feishu=True,
+    )
+    if result not in ("created", "duplicate"):
+        return {"ok": False, "error": result}
+    return {
+        "ok": True,
+        "todo_id": todo_id,
+        "duplicate": result == "duplicate",
+        "title": title,
+        "due_text": due.strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def _tool_propose_memory(args):
+    content = (args.get("content") or "").strip()
+    category = (args.get("category") or "").strip() or None
+    candidate_id, result = echomate_store.enqueue_memory_candidate(
+        OWNER_OPEN_ID,
+        content,
+        source="feishu_ai",
+        category=category,
+    )
+    return {
+        "ok": result in ("created", "duplicate"),
+        "candidate_id": candidate_id,
+        "result": result,
+    }
+
+
 def _tool_web_search(args):
     """调用 Tavily 搜索，返回标题、链接、摘要。"""
     query = (args.get("query") or "").strip()
@@ -1935,6 +1990,8 @@ def _tool_web_search(args):
 TOOL_HANDLERS = {
     "get_weather": _tool_get_weather,
     "list_todos": _tool_list_todos,
+    "add_todo": _tool_add_todo,
+    "propose_memory": _tool_propose_memory,
     "search_memories": _tool_search_memories,
     "web_search": _tool_web_search,
 }
@@ -2063,11 +2120,30 @@ def generate_ai_reply(chat_id, user_text):
 
     memory_items = load_memory_context()
 
+    # A clear reminder request is handled deterministically before the LLM.
+    if any(word in user_text for word in ("提醒我", "别忘了", "记得提醒")):
+        todo_result = assistant_actions.create_todo_from_text(
+            owner_id=OWNER_OPEN_ID,
+            text=user_text,
+            source="feishu",
+            chat_id=chat_id,
+            notify_deskbot=True,
+            notify_feishu=True,
+        )
+        if todo_result.get("ok"):
+            prefix = "已存在" if todo_result.get("duplicate") else "已创建"
+            return (
+                f"✅ {prefix}待办 #{todo_result['todo_id']}\n\n"
+                f"{todo_result['title']} · {todo_result['due_text']}\n"
+                "到点会通过桌宠和飞书提醒。"
+            )
+
     messages = [
         {
             "role": "system",
             "content": (
                 "你是 Echo-Mate，用户的个人助手。"
+                "你已连接共享待办和记忆；明确提醒请求会直接创建待办。"
                 "用简体中文自然对话，像朋友聊天，简洁但有信息量。\n"
                 "不要套固定格式，不要每次都列清单，"
                 "不要加「0 返回」这类导航提示。\n\n"
@@ -2087,11 +2163,8 @@ def generate_ai_reply(chat_id, user_text):
                 "4. 如果多个结果说法冲突，指出冲突，不要挑一个当结论。\n"
                 "5. 回答末尾附 1-3 个来源，格式：标题 - URL。\n"
                 "工具返回 ok=false 时如实说明，不要编造数据。\n\n"
-                "你无法直接创建或删除待办与记忆。"
-                "不要说「告诉我，我帮你记」「随时告诉我」"
-                "这类暗示你能代办的句子，因为你做不到。"
-                "需要时直接给出命令，例如："
-                "添加待办 2026-10-26 09:30 交周报。\n"
+                "明确说「提醒我」时系统会直接创建待办。"
+                "长期偏好或个人信息只生成候选记忆，必须由用户确认。\n"
                 "问天气时，如果用户说今天/明天/后天，"
                 "调用 get_weather 并传对应 day_offset。"
                 + memory_system_block(memory_items)
@@ -2191,117 +2264,58 @@ def send_text(receive_id, text, receive_id_type="chat_id"):
 # ==================== 到期提醒线程 ====================
 
 def reminder_loop():
-    print("[待办] 到期提醒调度器已启动，检查间隔 15 秒", flush=True)
+    print("[待办] 共享提醒调度器已启动，检查间隔 15 秒", flush=True)
 
     while True:
         try:
-            current_time = now_utc()
-            retry_before = (
-                datetime.now(timezone.utc) - timedelta(seconds=60)
-            ).isoformat(timespec="seconds")
+            echomate_store.materialize_due_reminders()
+            delivery = echomate_store.claim_delivery("feishu")
 
-            with db_conn() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT id, title, due_at_utc, chat_id
-                    FROM todos
-                    WHERE status = 'pending'
-                      AND reminded_at_utc IS NULL
-                      AND due_at_utc <= ?
-                      AND (
-                        last_attempt_at_utc IS NULL
-                        OR last_attempt_at_utc <= ?
-                      )
-                    ORDER BY due_at_utc
-                    LIMIT 20
-                    """,
-                    (current_time, retry_before),
-                ).fetchall()
+            if delivery:
+                todo_id = delivery["todo_id"]
+                title = delivery["title"]
+                chat_id = delivery["chat_id"]
+                delivery_id = delivery["delivery_id"]
 
-            for todo_id, title, due_utc, chat_id in rows:
-                attempt_time = now_utc()
-
-                # 先记录尝试时间，避免发送失败时每 15 秒刷屏。
-                with db_conn() as conn:
-                    cursor = conn.execute(
-                        """
-                        UPDATE todos
-                        SET last_attempt_at_utc = ?
-                        WHERE id = ?
-                          AND status = 'pending'
-                          AND reminded_at_utc IS NULL
-                          AND (
-                            last_attempt_at_utc IS NULL
-                            OR last_attempt_at_utc <= ?
-                          )
-                        """,
-                        (attempt_time, todo_id, retry_before),
+                if not chat_id:
+                    # A deskbot-created todo has no Feishu chat target.
+                    # Keep the shared record, but this channel cannot deliver it.
+                    echomate_store.mark_delivery(
+                        delivery_id, "skipped", "no Feishu chat_id"
                     )
-
-                if cursor.rowcount == 0:
-                    continue
-
-                due_display = format_due_friendly(due_utc)
-                content = (
-                    f"⏰ {title}\n\n"
-                    f"{due_display} · #{todo_id}\n"
-                    f"完成 → 完成待办 {todo_id}"
-                )
-
-                try:
-                    sent = send_text(chat_id, content)
-                except Exception as exc:
-                    print(
-                        f"[待办] #{todo_id} 发送异常：{type(exc).__name__}",
-                        flush=True,
+                    echomate_store.finalize_todo_if_delivered(todo_id)
+                else:
+                    due_display = format_due_friendly(delivery["due_at_utc"])
+                    content = (
+                        f"⏰ {title}\n\n"
+                        f"{due_display} · #{todo_id}\n"
+                        f"完成 → 完成待办 {todo_id}"
                     )
-                    sent = False
-
-                if sent:
-                    with db_conn() as conn:
-                        conn.execute(
-                            """
-                            UPDATE todos
-                            SET reminded_at_utc = ?
-                            WHERE id = ?
-                              AND status = 'pending'
-                              AND reminded_at_utc IS NULL
-                            """,
-                            (now_utc(), todo_id),
-                        )
-
-                    # 飞书提醒成功后，同步排入桌宠播报队列。
-                    # 失败不影响飞书，也不阻塞调度器。
                     try:
-                        notify_store.enqueue(
-                            kind="todo",
-                            text=f"待办提醒：{title}",
-                            dedupe_key=f"todo:{todo_id}",
-                            priority=5,
-                            ttl_minutes=120,
-                        )
+                        sent = send_text(chat_id, content)
                     except Exception as exc:
                         print(
-                            f"[待办] #{todo_id} 入播报队列失败："
-                            f"{type(exc).__name__}",
+                            f"[待办] #{todo_id} 发送异常：{type(exc).__name__}",
                             flush=True,
                         )
-                else:
-                    print(
-                        f"[待办] #{todo_id} 提醒发送失败，稍后重试",
-                        flush=True,
-                    )
+                        sent = False
+
+                    if sent:
+                        echomate_store.mark_delivery(delivery_id, "sent")
+                        echomate_store.finalize_todo_if_delivered(todo_id)
+                    else:
+                        echomate_store.mark_delivery(
+                            delivery_id, "failed", "Feishu send failed"
+                        )
+
+            time.sleep(15)
 
         except Exception as exc:
             print(
-                f"[待办] 调度器异常：{type(exc).__name__}",
+                f"[待办] 调度异常：{type(exc).__name__}",
                 flush=True,
             )
-
-        time.sleep(15)
-
-
-# ==================== 飞书事件处理 ====================
+            time.sleep(5)
 
 def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
     header = getattr(data, "header", None)
@@ -2349,6 +2363,7 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
         print("[飞书] 事件缺少唯一 ID，已忽略", flush=True)
         return
 
+    CURRENT_CHAT_ID.set(message.chat_id)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     reply = None
 
@@ -2414,6 +2429,7 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
 init_db()
 init_chat_table()
+echomate_store.init_schema()
 
 threading.Thread(
     target=reminder_loop,

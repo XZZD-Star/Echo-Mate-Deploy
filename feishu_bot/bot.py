@@ -433,11 +433,13 @@ def render_todo(conn):
 
 def render_todo_new():
     return (
-        "➕ 建个待办\n\n"
-        "照着发：\n"
-        "添加待办 2026-10-26 09:30 交周报\n\n"
-        "时间用 24 小时制，北京时间\n\n"
-        "0 返回"
+        "➕ 新建待办\n\n"
+        "这个页面只处理结构化待办。发：\n"
+        "2026-10-27 09:00 交作业\n"
+        "明天 9:00 交作业\n"
+        "14:44 该睡觉了\n\n"
+        "时间按北京时间解析。\n"
+        "0 退出，退出后恢复普通聊天。"
     )
 
 
@@ -821,37 +823,6 @@ def _parse_natural_todo(text, allow_time_only=False):
     return None
 
 
-def _looks_like_todo(text):
-    """判断消息是否明显在说待办，用于拦截 AI。"""
-    raw = (text or "").strip()
-
-    if any(
-        word in raw
-        for word in ("待办", "提醒我", "提醒一下", "记得提醒")
-    ):
-        return True
-
-    if _parse_natural_todo(raw) is not None:
-        return True
-
-    return False
-
-
-def todo_hint_reply(text):
-    """看起来像待办但没解析成功时，给格式引导而不是交给 AI。"""
-    if not _looks_like_todo(text):
-        return None
-
-    return (
-        "😅 这条没接上\n\n"
-        "新待办这样发：\n"
-        "添加待办 2026-10-26 09:30 交周报\n\n"
-        "也可以直接发：\n"
-        "2026-10-26 09:30 交周报\n\n"
-        "3 新建 · 0 返回"
-    )
-
-
 def handle_command(conn, text, chat_id):
     text = text.strip()
     page = get_page(chat_id, conn=conn)
@@ -990,7 +961,8 @@ def handle_command(conn, text, chat_id):
     # -------- 创建待办 --------
 
     if text.startswith(("添加待办", "新建待办")):
-        # 先尝试宽松解析：前缀 + 日期 + 任意冒号/点号 + 事项
+        # A valid explicit command works anywhere. Invalid text falls through
+        # to the current page or to the AI router instead of being intercepted.
         prefix_match = re.match(
             r"^(?:添加待办|新建待办)\s+"
             r"(\d{4}-\d{2}-\d{2})\s+"
@@ -1003,18 +975,6 @@ def handle_command(conn, text, chat_id):
             return _add_todo(
                 conn, chat_id, date_text,
                 f"{int(hour):02d}:{minute}", title,
-            )
-
-        if not re.match(
-            r"^添加待办\s+\d{4}-\d{2}-\d{2}\s+"
-            r"\d{2}:\d{2}\s+.+$",
-            text,
-            re.DOTALL,
-        ):
-            return (
-                "😅 格式差一点\n\n"
-                "添加待办 2026-10-26 09:30 交周报\n\n"
-                "3 重填 · 0 返回"
             )
 
     match = re.match(
@@ -1207,15 +1167,16 @@ def handle_command(conn, text, chat_id):
             "0 返回"
         )
 
-    # -------- 自然输入：日期/今天明天 + 时间 + 事项 --------
+    # -------- 页面上下文：只有 todo_new 要求结构化输入 --------
 
-    parsed = _parse_natural_todo(
-        text, allow_time_only=page in {"todo", "todo_new"}
-    )
-    if parsed is not None:
-        date_text, time_text, title = parsed
-        return _add_todo(conn, chat_id, date_text, time_text, title)
+    if page == "todo_new":
+        parsed = _parse_natural_todo(text, allow_time_only=True)
+        if parsed is not None:
+            date_text, time_text, title = parsed
+            return _add_todo(conn, chat_id, date_text, time_text, title)
+        return render_todo_new() + "\n\n😅 这次没解析成功，请按上面的格式重发。"
 
+    # Outside todo_new, free text belongs to the AI tool router.
     return None
 
 
@@ -2120,30 +2081,15 @@ def generate_ai_reply(chat_id, user_text):
 
     memory_items = load_memory_context()
 
-    # A clear reminder request is handled deterministically before the LLM.
-    if any(word in user_text for word in ("提醒我", "别忘了", "记得提醒")):
-        todo_result = assistant_actions.create_todo_from_text(
-            owner_id=OWNER_OPEN_ID,
-            text=user_text,
-            source="feishu",
-            chat_id=chat_id,
-            notify_deskbot=True,
-            notify_feishu=True,
-        )
-        if todo_result.get("ok"):
-            prefix = "已存在" if todo_result.get("duplicate") else "已创建"
-            return (
-                f"✅ {prefix}待办 #{todo_result['todo_id']}\n\n"
-                f"{todo_result['title']} · {todo_result['due_text']}\n"
-                "到点会通过桌宠和飞书提醒。"
-            )
-
     messages = [
         {
             "role": "system",
             "content": (
                 "你是 Echo-Mate，用户的个人助手。"
-                "你已连接共享待办和记忆；明确提醒请求会直接创建待办。"
+                "你已连接共享待办和记忆。"
+                f"当前北京时间是 {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')}。"
+                "用户表达新建、提醒或安排待办的意图时，调用 add_todo，"
+                "不要把自由文本要求成固定格式。"
                 "用简体中文自然对话，像朋友聊天，简洁但有信息量。\n"
                 "不要套固定格式，不要每次都列清单，"
                 "不要加「0 返回」这类导航提示。\n\n"
@@ -2163,8 +2109,8 @@ def generate_ai_reply(chat_id, user_text):
                 "4. 如果多个结果说法冲突，指出冲突，不要挑一个当结论。\n"
                 "5. 回答末尾附 1-3 个来源，格式：标题 - URL。\n"
                 "工具返回 ok=false 时如实说明，不要编造数据。\n\n"
-                "明确说「提醒我」时系统会直接创建待办。"
-                "长期偏好或个人信息只生成候选记忆，必须由用户确认。\n"
+                "长期偏好或个人信息只调用 propose_memory 生成候选，"
+                "必须由用户确认，不能声称已永久保存。\n"
                 "问天气时，如果用户说今天/明天/后天，"
                 "调用 get_weather 并传对应 day_offset。"
                 + memory_system_block(memory_items)
@@ -2392,9 +2338,6 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
         return
     finally:
         conn.close()
-
-    if reply is None:
-        reply = todo_hint_reply(user_text)
 
     if reply is None:
         match = re.match(r"^(?:记住|保存记忆)\s*[:：]\s*(.+)$", user_text, re.DOTALL)

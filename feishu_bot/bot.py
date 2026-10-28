@@ -738,8 +738,9 @@ def _kind_label(kind):
 
 
 def _enter(conn, chat_id, page):
+    reply = render_page(conn, chat_id, page)
     set_page(chat_id, page, conn=conn)
-    return render_page(conn, chat_id, page)
+    return reply
 
 
 def _toggle(kind_key, target):
@@ -2397,6 +2398,7 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
     CURRENT_CHAT_ID.set(message.chat_id)
     conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
     reply = None
 
     try:

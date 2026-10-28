@@ -180,6 +180,7 @@ def init_chat_table():
 
 PAGES = {
     "menu", "status", "status_detail", "todo", "todo_new",
+    "todo_history",
     "memory", "help", "notify", "quiet", "records",
     "memory_clear_confirm",
 }
@@ -187,6 +188,8 @@ PAGES = {
 # 0 返回上一级；未列出的页面回到主菜单。
 PAGE_PARENT = {
     "status_detail": "status",
+    "todo_new": "todo",
+    "todo_history": "todo",
     "quiet": "notify",
     "records": "notify",
     "memory_clear_confirm": "memory",
@@ -393,16 +396,30 @@ def render_status_detail():
     return "\n".join(lines)
 
 
+def _todo_window():
+    """Return [today 00:00, day-after-tomorrow 00:00) in UTC."""
+    today = datetime.now(LOCAL_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start = today.astimezone(timezone.utc).isoformat(timespec="seconds")
+    end = (today + timedelta(days=2)).astimezone(
+        timezone.utc
+    ).isoformat(timespec="seconds")
+    return start, end
+
+
 def _todo_rows(conn, limit=20):
+    start, end = _todo_window()
     return conn.execute(
         """
-        SELECT id, title, due_at_utc
+        SELECT id, title, due_at_utc, reminded_at_utc
         FROM todos
         WHERE owner_id = ? AND status = 'pending'
+          AND due_at_utc >= ? AND due_at_utc < ?
         ORDER BY due_at_utc ASC
         LIMIT ?
         """,
-        (OWNER_OPEN_ID, limit),
+        (OWNER_OPEN_ID, start, end, limit),
     ).fetchall()
 
 
@@ -411,23 +428,89 @@ def render_todo(conn):
 
     if not rows:
         return (
-            "📋 今天很轻松\n\n"
-            "没有待办，去歇会儿吧\n\n"
-            "3 新建 · 0 返回"
+            "📋 今天和明天\n\n"
+            "今天和明天都没有待办，休息一下吧 ☕\n\n"
+            "3 新建待办\n"
+            "4 历史待办\n"
+            "0 返回"
         )
 
-    lines = [f"📋 你有 {len(rows)} 件事", ""]
-    for todo_id, title, due_utc in rows:
-        lines.append(
-            f"#{todo_id} · {format_due_friendly(due_utc)} · {title}"
-        )
+    today = datetime.now(LOCAL_TZ).date()
+    groups = {"今天": [], "明天": []}
+    for row in rows:
+        due = datetime.fromisoformat(row["due_at_utc"]).astimezone(LOCAL_TZ)
+        day = "今天" if due.date() == today else "明天"
+        groups[day].append(row)
 
-    first_id = rows[0][0]
+    lines = ["📋 今天和明天", ""]
+    sequence = 1
+    for day, icon in (("今天", "🌤"), ("明天", "🌙")):
+        items = groups[day]
+        if not items:
+            continue
+        lines.append(f"{icon} {day}")
+        for row in items:
+            due = datetime.fromisoformat(
+                row["due_at_utc"]
+            ).astimezone(LOCAL_TZ)
+            lines.append(
+                f"{sequence} · {due:%H:%M} · {row['title']}"
+            )
+            lines.append(
+                f"   完成待办 {row['id']} · 取消待办 {row['id']}"
+            )
+            sequence += 1
+        lines.append("")
+
     lines.extend([
-        "",
-        f"完成 → 完成待办 {first_id}",
-        "3 新建 · 0 返回",
+        "📜 4 历史待办",
+        "➕ 3 新建待办",
+        "0 返回",
     ])
+    return "\n".join(lines)
+
+
+def render_todo_history(conn, limit=20):
+    today = datetime.now(LOCAL_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_utc = today.astimezone(timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    rows = conn.execute(
+        """
+        SELECT id, title, due_at_utc, status, reminded_at_utc
+        FROM todos
+        WHERE owner_id = ?
+          AND (
+              status = 'completed'
+              OR (status = 'pending' AND due_at_utc < ?)
+          )
+        ORDER BY due_at_utc DESC
+        LIMIT ?
+        """,
+        (OWNER_OPEN_ID, today_utc, limit),
+    ).fetchall()
+
+    if not rows:
+        return "📜 历史待办\n\n还没有已完成或过期的待办\n\n0 返回"
+
+    lines = ["📜 历史待办", ""]
+    for row in rows:
+        due = datetime.fromisoformat(
+            row["due_at_utc"]
+        ).astimezone(LOCAL_TZ)
+        if row["status"] == "completed":
+            mark = "✅ 已完成"
+        elif row["reminded_at_utc"]:
+            mark = "⏰ 已提醒"
+        else:
+            mark = "⌛ 已过期"
+        lines.append(
+            f"{mark} · {due:%m-%d %H:%M} · {row['title']}"
+        )
+
+    lines.extend(["", "0 返回"])
     return "\n".join(lines)
 
 
@@ -608,6 +691,8 @@ def render_page(conn, chat_id, page):
         return render_todo(conn)
     if page == "todo_new":
         return render_todo_new()
+    if page == "todo_history":
+        return render_todo_history(conn)
     if page == "memory":
         return render_memory(conn)
     if page == "help":
@@ -692,6 +777,8 @@ def _handle_page_number(conn, chat_id, page, text):
     elif page == "todo":
         if text == "3":
             return _enter(conn, chat_id, "todo_new")
+        if text == "4":
+            return _enter(conn, chat_id, "todo_history")
 
     elif page == "memory":
         if text == "1":
@@ -878,19 +965,12 @@ def handle_command(conn, text, chat_id):
         handled = _handle_page_number(conn, chat_id, page, text)
         if handled is not None:
             return handled
-
-        # 本页没有这个数字，但主菜单有：直接跳到主菜单对应页面。
-        target = {
-            "1": "status",
-            "2": "todo",
-            "3": "todo_new",
-            "4": "memory",
-            "5": "help",
-            "6": "notify",
-        }.get(text)
-
-        if target and page != "menu":
-            return _enter(conn, chat_id, target)
+        if page != "menu":
+            return (
+                "😅 本页没有这个操作\n\n"
+                "请按当前页面提示输入\n\n"
+                "0 返回"
+            )
 
     # -------- 直接进入页面的文字命令 --------
 
@@ -914,6 +994,9 @@ def handle_command(conn, text, chat_id):
 
     if text in {"我的待办", "待办列表", "查看待办", "待办"}:
         return _enter(conn, chat_id, "todo")
+
+    if text in {"历史待办", "待办历史"}:
+        return _enter(conn, chat_id, "todo_history")
 
     if text in {"列出记忆", "我的记忆", "记忆列表", "记忆"}:
         return _enter(conn, chat_id, "memory")
@@ -1025,28 +1108,12 @@ def handle_command(conn, text, chat_id):
             )
 
         if action == "取消待办":
-            return f"✅ #{todo_id} 取消\n\n2 看待办 · 0 返回"
-
-        remaining = conn.execute(
-            """
-            SELECT COUNT(*) FROM todos
-            WHERE owner_id = ? AND status = 'pending'
-            """,
-            (OWNER_OPEN_ID,),
-        ).fetchone()[0]
-
-        if not remaining:
             return (
-                "🎉 全部完成\n\n"
-                "今天没有待办\n\n"
-                "3 新建 · 0 返回"
+                f"🧹 #{todo_id} 已移出待办\n\n"
+                + render_todo(conn)
             )
 
-        return (
-            f"✅ #{todo_id} 完成\n\n"
-            f"还有 {remaining} 件事，加油 💪\n\n"
-            "2 看待办 · 0 返回"
-        )
+        return f"✅ #{todo_id} 完成\n\n" + render_todo(conn)
 
     # -------- 保存记忆 --------
 

@@ -196,6 +196,29 @@ PAGE_PARENT = {
     "memory_clear_confirm": "memory",
 }
 
+
+def default_nav_stack(page):
+    if page == "menu":
+        return ["menu"]
+    parent = PAGE_PARENT.get(page, "menu")
+    if parent == "menu":
+        return ["menu", page]
+    return ["menu", parent, page]
+
+
+def state_nav_stack(state):
+    page = state.get("page", "menu")
+    stack = state.get("nav_stack")
+    if (
+        isinstance(stack, list)
+        and stack
+        and all(item in PAGES for item in stack)
+        and stack[-1] == page
+    ):
+        return stack
+    return default_nav_stack(page)
+
+
 PAGE_UNKNOWN_HINT = {
     "status": "😅 状态页只有 1 刷新、2 详情、0 返回",
     "status_detail": "😅 状态详情页只有 1 刷新、0 返回",
@@ -588,48 +611,51 @@ def render_memory(conn, show_all=False):
 
     if not total:
         return (
-            "📚 记忆 · 0 条\n\n"
+            "📚 记忆\n\n"
             "还没有记忆\n\n"
-            "存：记住：喜欢简短回答\n\n"
+            "💾 存记忆：记住 喜欢简短回答\n\n"
             "0 返回"
         )
 
     rows = _memory_rows(conn, 30 if show_all else 3)
 
     lines = [f"📚 记忆 · {total} 条", ""]
-    for memory_id, content in rows:
-        lines.append(f"#{memory_id} · {content[:60]}")
+    for sequence, (memory_id, content) in enumerate(rows, 1):
+        lines.append(f"{sequence}. #{memory_id}  {content[:60]}")
 
     if not show_all and total > len(rows):
-        lines.append(f"…还有 {total - len(rows)} 条")
+        lines.append(f"\n…还有 {total - len(rows)} 条")
 
     lines.extend([
         "",
-        "⚙️ 操作",
-        "查：查记忆 回答",
-        "存：记住：喜欢简短回答",
-        "删：删除记忆 3",
+        "🔎 查记忆：查记忆 服务器",
+        "💾 存记忆：记住 喜欢简短回答",
+        f"🗑 删除记忆：删除记忆 {rows[0][0]}",
     ])
 
     if show_all:
         lines.extend(["", "0 返回"])
     else:
-        lines.extend(["", "1 全部 · 0 返回"])
+        lines.extend(["", "1 查看全部", "0 返回"])
 
     return "\n".join(lines)
 
 
 def render_help():
     return (
-        "💡 Echo 会这些\n\n"
+        "💡 帮助\n\n"
         "📋 待办\n"
-        "添加待办 2026-10-26 09:30 交周报\n"
-        "我的待办 · 完成待办 6\n\n"
+        "➕ 新建待办：添加待办 2026-10-29 09:00 交作业\n"
+        "📄 查看待办：待办\n"
+        "✅ 完成待办：完成 今天待办1\n"
+        "🧹 取消待办：取消 明天待办1\n\n"
         "📚 记忆\n"
-        "存：记住：喜欢简短回答\n"
-        "查：查记忆 回答\n\n"
+        "💾 存记忆：记住 喜欢简短回答\n"
+        "🔎 查记忆：查记忆 服务器\n"
+        "🗑 删除记忆：删除记忆 12\n\n"
         "🔊 播报\n"
-        "静音 23:00 08:00 · 关闭静音\n\n"
+        "🌙 设置静音：静音 23:00 08:00\n"
+        "☀️ 取消静音：关闭静音\n\n"
         "0 返回"
     )
 
@@ -778,13 +804,47 @@ def _kind_label(kind):
     }.get(kind, kind)
 
 
-def _enter(conn, chat_id, page):
+def _render_page_state(conn, chat_id, page):
     state = None
     if page == "todo":
         reply, state = _build_todo_page(conn)
     else:
         reply = render_page(conn, chat_id, page)
-    set_page(chat_id, page, state=state, conn=conn)
+    return reply, state or {}
+
+
+def _enter(conn, chat_id, page, mode="push"):
+    current_state = get_page_state(chat_id, conn=conn)
+    current_page = current_state.get("page", "menu")
+    stack = state_nav_stack(current_state)
+
+    if mode == "reset":
+        stack = default_nav_stack(page)
+    elif mode == "replace":
+        if len(stack) >= 2 and stack[-2] == page:
+            stack = stack[:-1]
+        else:
+            stack = stack[:-1] + [page] if stack else [page]
+    elif current_page != page:
+        stack = stack + [page]
+
+    reply, extra_state = _render_page_state(conn, chat_id, page)
+    extra_state["nav_stack"] = stack
+    set_page(chat_id, page, state=extra_state, conn=conn)
+    return reply
+
+
+def _navigate_back(conn, chat_id):
+    state = get_page_state(chat_id, conn=conn)
+    stack = state_nav_stack(state)
+    if len(stack) <= 1:
+        return _enter(conn, chat_id, "menu", mode="reset")
+
+    target = stack[-2]
+    next_stack = stack[:-1]
+    reply, extra_state = _render_page_state(conn, chat_id, target)
+    extra_state["nav_stack"] = next_stack
+    set_page(chat_id, target, state=extra_state, conn=conn)
     return reply
 
 
@@ -888,7 +948,9 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
             f"ℹ️ 这条待办已经存在 #{todo_id}\n\n"
             f"{title} · {format_due_friendly(due_utc)}"
         )
-        return return_message + "\n\n" + _enter(conn, chat_id, "todo")
+        return return_message + "\n\n" + _enter(
+            conn, chat_id, "todo", mode="replace"
+        )
 
     if result != "created":
         return "😅 待办没保存成功，稍后再试\n\n直接按格式重发 · 0 返回"
@@ -898,7 +960,9 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
         f"{title} · {format_due_friendly(due_utc)}\n"
         "到点我会提醒你"
     )
-    return return_message + "\n\n" + _enter(conn, chat_id, "todo")
+    return return_message + "\n\n" + _enter(
+        conn, chat_id, "todo", mode="replace"
+    )
 
 
 def _parse_natural_todo(text, allow_time_only=False):
@@ -979,7 +1043,7 @@ def _handle_todo_action(conn, text, chat_id):
     if state.get("day_key") != today_key:
         return (
             "😅 待办页已经跨天，已重新加载\n\n"
-            + _enter(conn, chat_id, "todo")
+            + _enter(conn, chat_id, "todo", mode="replace")
         )
 
     id_key = "today_ids" if day == "今天" else "tomorrow_ids"
@@ -988,7 +1052,7 @@ def _handle_todo_action(conn, text, chat_id):
     if index < 1 or index > len(todo_ids):
         return (
             f"😅 没有找到{day}待办{index}\n\n"
-            + _enter(conn, chat_id, "todo")
+            + _enter(conn, chat_id, "todo", mode="replace")
         )
 
     todo_id = int(todo_ids[index - 1])
@@ -1003,7 +1067,7 @@ def _handle_todo_action(conn, text, chat_id):
     if not cursor.rowcount:
         return (
             f"😅 {day}待办{index} 已经变化\n\n"
-            + _enter(conn, chat_id, "todo")
+            + _enter(conn, chat_id, "todo", mode="replace")
         )
 
     marker = "✅ 已完成" if action == "完成" else "🧹 已取消"
@@ -1053,11 +1117,10 @@ def handle_command(conn, text, chat_id):
     # -------- 全局导航 --------
 
     if text in {"菜单", "功能"}:
-        return _enter(conn, chat_id, "menu")
+        return _enter(conn, chat_id, "menu", mode="reset")
 
     if text == "0":
-        parent = PAGE_PARENT.get(page, "menu")
-        return _enter(conn, chat_id, parent)
+        return _navigate_back(conn, chat_id)
 
     # -------- 页面内数字 --------
 
@@ -1080,31 +1143,31 @@ def handle_command(conn, text, chat_id):
         "检查 VPS", "检查VPS", "VPS 状态", "VPS状态",
         "服务器状态", "状态",
     }:
-        return _enter(conn, chat_id, "status")
+        return _enter(conn, chat_id, "status", mode="reset")
 
     if text in {"状态详情", "详情"}:
-        return _enter(conn, chat_id, "status_detail")
+        return _enter(conn, chat_id, "status_detail", mode="reset")
 
     if text == "帮助":
-        return _enter(conn, chat_id, "help")
+        return _enter(conn, chat_id, "help", mode="reset")
 
     if text in {"播报设置", "语音播报设置"}:
-        return _enter(conn, chat_id, "notify")
+        return _enter(conn, chat_id, "notify", mode="reset")
 
     if text in {"播报记录", "语音播报记录"}:
-        return _enter(conn, chat_id, "records")
+        return _enter(conn, chat_id, "records", mode="reset")
 
     if text in {"我的待办", "待办列表", "查看待办", "待办"}:
-        return _enter(conn, chat_id, "todo")
+        return _enter(conn, chat_id, "todo", mode="reset")
 
     if text in {"历史待办", "待办历史"}:
-        return _enter(conn, chat_id, "todo_history")
+        return _enter(conn, chat_id, "todo_history", mode="reset")
 
     if text in {"列出记忆", "我的记忆", "记忆列表", "记忆"}:
-        return _enter(conn, chat_id, "memory")
+        return _enter(conn, chat_id, "memory", mode="reset")
 
     if text in {"添加待办", "新建待办"}:
-        return _enter(conn, chat_id, "todo_new")
+        return _enter(conn, chat_id, "todo_new", mode="reset")
 
     # -------- 静音设置 --------
 
@@ -1211,17 +1274,17 @@ def handle_command(conn, text, chat_id):
         if action == "取消待办":
             return (
                 f"🧹 #{todo_id} 已移出待办\n\n"
-                + _enter(conn, chat_id, "todo")
+                + _enter(conn, chat_id, "todo", mode="replace")
             )
 
         return f"✅ #{todo_id} 完成\n\n" + _enter(
-            conn, chat_id, "todo"
+            conn, chat_id, "todo", mode="replace"
         )
 
     # -------- 保存记忆 --------
 
     match = re.match(
-        r"^(?:记住|保存记忆)\s*[:：]\s*(.+)$",
+        r"^(?:记住|保存记忆)(?:\s*[:：]\s*|\s+)(.+)$",
         text,
         re.DOTALL,
     )
@@ -1345,7 +1408,7 @@ def handle_command(conn, text, chat_id):
         set_page(chat_id, "memory", conn=conn)
         return (
             f"✅ 清空了 {removed} 条记忆\n\n"
-            "以后想存新的，发：记住：内容\n\n"
+            "以后想存新的，发：记住 内容\n\n"
             "0 返回"
         )
 
@@ -1689,14 +1752,14 @@ def weather_reply(text):
             return (
                 f"😅 没找到「{asked_place}」这个地方\n\n"
                 "发「南昌天气」试试，或者发\n"
-                "记住：我现在居住地是城市名\n"
+                "记住 我现在居住地是城市名\n"
             )
 
         return (
             "🌤 想知道哪里的天气？\n\n"
             "发「南昌天气」这样就行\n"
             "也可以先存一条居住地：\n"
-            "记住：我现在居住地是江西南昌"
+            "记住 我现在居住地是江西南昌"
         )
 
     data = _fetch_weather(place_info)
@@ -2530,7 +2593,11 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
         conn.close()
 
     if reply is None:
-        match = re.match(r"^(?:记住|保存记忆)\s*[:：]\s*(.+)$", user_text, re.DOTALL)
+        match = re.match(
+            r"^(?:记住|保存记忆)(?:\s*[:：]\s*|\s+)(.+)$",
+            user_text,
+            re.DOTALL,
+        )
         if match:
             with db_conn() as mem_conn:
                 candidate_id, result = memory_store.enqueue_candidate(

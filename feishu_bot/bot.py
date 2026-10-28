@@ -58,6 +58,7 @@ os.chmod(DB_PATH.parent, 0o700)
 def db_conn():
     """连接用完必须关闭，否则 WAL 下会累积句柄并持有写锁。"""
     conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
     try:
         yield conn
         conn.commit()
@@ -195,6 +196,25 @@ PAGE_PARENT = {
     "memory_clear_confirm": "memory",
 }
 
+PAGE_UNKNOWN_HINT = {
+    "status": "😅 状态页只有 1 刷新、2 详情、0 返回",
+    "status_detail": "😅 状态详情页只有 1 刷新、0 返回",
+    "todo": (
+        "😅 待办页没有这个数字操作\n"
+        "完成：完成 今天待办1\n"
+        "取消：取消 明天待办1\n"
+        "0 返回"
+    ),
+    "todo_new": "😅 新建待办页只接收结构化待办\n0 返回",
+    "todo_history": "😅 历史待办页没有这个数字操作\n0 返回",
+    "memory": "😅 记忆页只有 1 展开全部、0 返回",
+    "help": "😅 帮助页只有 0 返回",
+    "notify": "😅 播报设置页只有 1 到 4 的操作、0 返回",
+    "quiet": "😅 静音页没有数字操作\n0 返回",
+    "records": "😅 播报记录页没有数字操作\n0 返回",
+    "memory_clear_confirm": "😅 请发送“确认清空记忆”或 0 返回",
+}
+
 SERVICE_UNITS = [
     ("echomate-server.service", "语音", "echomate-server"),
     ("echomate-feishu-bot.service", "飞书", "echomate-feishu-bot"),
@@ -243,37 +263,45 @@ def _write_setting(conn, key, value):
     return True
 
 
-def get_page(chat_id, conn=None):
-    """读取当前页面；超过 24 小时未活动则回到主菜单。"""
+def get_page_state(chat_id, conn=None):
+    """读取当前页面和页面内映射；超过 24 小时未活动则回到主菜单。"""
     raw = _read_setting(conn, page_key(chat_id), "")
     if not raw:
-        return "menu"
+        return {"page": "menu"}
 
     try:
         data = json.loads(raw)
         page = data.get("page", "menu")
         stamp = datetime.fromisoformat(data["at"])
     except (ValueError, KeyError, TypeError):
-        return "menu"
+        return {"page": "menu"}
 
     if page not in PAGES:
-        return "menu"
+        return {"page": "menu"}
 
     if (
         datetime.now(timezone.utc) - stamp
     ).total_seconds() > PAGE_TTL_SECONDS:
-        return "menu"
+        return {"page": "menu"}
 
-    return page
+    data["page"] = page
+    return data
 
 
-def set_page(chat_id, page, conn=None):
+def get_page(chat_id, conn=None):
+    return get_page_state(chat_id, conn=conn)["page"]
+
+
+def set_page(chat_id, page, state=None, conn=None):
     if page not in PAGES:
         page = "menu"
+    data = {"page": page, "at": now_utc()}
+    if state:
+        data.update(state)
     _write_setting(
         conn,
         page_key(chat_id),
-        json.dumps({"page": page, "at": now_utc()}),
+        json.dumps(data),
     )
 
 
@@ -423,17 +451,18 @@ def _todo_rows(conn, limit=20):
     ).fetchall()
 
 
-def render_todo(conn):
+def _build_todo_page(conn):
     rows = _todo_rows(conn)
 
     if not rows:
-        return (
+        reply = (
             "📋 今天和明天\n\n"
             "今天和明天都没有待办，休息一下吧 ☕\n\n"
             "3 新建待办\n"
             "4 历史待办\n"
             "0 返回"
         )
+        return reply, {"day_key": datetime.now(LOCAL_TZ).date().isoformat()}
 
     today = datetime.now(LOCAL_TZ).date()
     groups = {"今天": [], "明天": []}
@@ -442,32 +471,44 @@ def render_todo(conn):
         day = "今天" if due.date() == today else "明天"
         groups[day].append(row)
 
-    lines = ["📋 今天和明天", ""]
-    sequence = 1
+    lines = [
+        f"📋 今天 {len(groups['今天'])} 项 · 明天 {len(groups['明天'])} 项",
+        "",
+    ]
     for day, icon in (("今天", "🌤"), ("明天", "🌙")):
         items = groups[day]
         if not items:
             continue
         lines.append(f"{icon} {day}")
-        for row in items:
+        for sequence, row in enumerate(items, 1):
             due = datetime.fromisoformat(
                 row["due_at_utc"]
             ).astimezone(LOCAL_TZ)
             lines.append(
-                f"{sequence} · {due:%H:%M} · {row['title']}"
+                f"{sequence}. {due:%H:%M}  {row['title']}"
             )
-            lines.append(
-                f"   完成待办 {row['id']} · 取消待办 {row['id']}"
-            )
-            sequence += 1
         lines.append("")
 
+    complete_day = "今天" if groups["今天"] else "明天"
+    cancel_day = "明天" if groups["明天"] else "今天"
     lines.extend([
+        f"✅ 完成：完成 {complete_day}待办1",
+        f"🧹 取消：取消 {cancel_day}待办1",
+        "",
         "📜 4 历史待办",
         "➕ 3 新建待办",
         "0 返回",
     ])
-    return "\n".join(lines)
+    state = {
+        "day_key": today.isoformat(),
+        "today_ids": [row["id"] for row in groups["今天"]],
+        "tomorrow_ids": [row["id"] for row in groups["明天"]],
+    }
+    return "\n".join(lines), state
+
+
+def render_todo(conn):
+    return _build_todo_page(conn)[0]
 
 
 def render_todo_history(conn, limit=20):
@@ -738,8 +779,12 @@ def _kind_label(kind):
 
 
 def _enter(conn, chat_id, page):
-    reply = render_page(conn, chat_id, page)
-    set_page(chat_id, page, conn=conn)
+    state = None
+    if page == "todo":
+        reply, state = _build_todo_page(conn)
+    else:
+        reply = render_page(conn, chat_id, page)
+    set_page(chat_id, page, state=state, conn=conn)
     return reply
 
 
@@ -748,7 +793,7 @@ def _toggle(kind_key, target):
     new_value = "0" if current == "1" else "1"
     notify_store.set_setting(kind_key, new_value)
     state_text = "关闭" if new_value == "0" else "开启"
-    return f"✅ {target}播报{state_text}\n\n6 看播报 · 0 返回"
+    return f"✅ {target}播报{state_text}\n\n4 播报记录 · 0 返回"
 
 
 def _handle_page_number(conn, chat_id, page, text):
@@ -803,24 +848,24 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
     title = (title or "").strip()
 
     if not title:
-        return "😅 待办得写点内容\n\n3 重填 · 0 返回"
+        return "😅 待办得写点内容\n\n直接按格式重发 · 0 返回"
 
     if len(title) > 200:
-        return "😅 标题太长，200 字以内\n\n3 重填 · 0 返回"
+        return "😅 标题太长，200 字以内\n\n直接按格式重发 · 0 返回"
 
     try:
         due_local = datetime.strptime(
             f"{date_text} {time_text}", "%Y-%m-%d %H:%M"
         ).replace(tzinfo=LOCAL_TZ)
     except ValueError:
-        return "😅 日期写成 2026-10-26 09:30 这样\n\n3 重填 · 0 返回"
+        return "😅 日期写成 2026-10-26 09:30 这样\n\n直接按格式重发 · 0 返回"
 
     if due_local <= datetime.now(LOCAL_TZ):
         return (
             "😅 这个时间不能早于当前时间\n\n"
             f"现在是 {datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M}\n"
             "请填写之后的时间\n\n"
-            "3 重填 · 0 返回"
+            "直接按格式重发 · 0 返回"
         )
 
     due_utc = due_local.astimezone(timezone.utc).isoformat(
@@ -839,21 +884,21 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
     )
 
     if result == "duplicate":
-        return (
+        return_message = (
             f"ℹ️ 这条待办已经存在 #{todo_id}\n\n"
-            f"{title} · {format_due_friendly(due_utc)}\n\n"
-            "2 看待办 · 0 返回"
+            f"{title} · {format_due_friendly(due_utc)}"
         )
+        return return_message + "\n\n" + _enter(conn, chat_id, "todo")
 
     if result != "created":
-        return "😅 待办没保存成功，稍后再试\n\n3 重填 · 0 返回"
+        return "😅 待办没保存成功，稍后再试\n\n直接按格式重发 · 0 返回"
 
-    return (
+    return_message = (
         f"✅ 记下了 #{todo_id}\n\n"
         f"{title} · {format_due_friendly(due_utc)}\n"
-        "到点我会提醒你\n\n"
-        "2 看待办 · 0 返回"
+        "到点我会提醒你"
     )
+    return return_message + "\n\n" + _enter(conn, chat_id, "todo")
 
 
 def _parse_natural_todo(text, allow_time_only=False):
@@ -917,9 +962,63 @@ def _parse_natural_todo(text, allow_time_only=False):
     return None
 
 
+def _handle_todo_action(conn, text, chat_id):
+    match = re.match(
+        r"^(完成|取消)\s*(今天|明天)待办\s*#?(\d+)\s*$",
+        text,
+    )
+    if not match:
+        return None
+
+    action, day, index_text = match.groups()
+    state = get_page_state(chat_id, conn=conn)
+    if state.get("page") != "todo":
+        return "😅 请先进入待办页再操作\n\n发送：待办"
+
+    today_key = datetime.now(LOCAL_TZ).date().isoformat()
+    if state.get("day_key") != today_key:
+        return (
+            "😅 待办页已经跨天，已重新加载\n\n"
+            + _enter(conn, chat_id, "todo")
+        )
+
+    id_key = "today_ids" if day == "今天" else "tomorrow_ids"
+    todo_ids = state.get(id_key) or []
+    index = int(index_text)
+    if index < 1 or index > len(todo_ids):
+        return (
+            f"😅 没有找到{day}待办{index}\n\n"
+            + _enter(conn, chat_id, "todo")
+        )
+
+    todo_id = int(todo_ids[index - 1])
+    status = "completed" if action == "完成" else "cancelled"
+    cursor = conn.execute(
+        """
+        UPDATE todos SET status = ?
+        WHERE id = ? AND owner_id = ? AND status = 'pending'
+        """,
+        (status, todo_id, OWNER_OPEN_ID),
+    )
+    if not cursor.rowcount:
+        return (
+            f"😅 {day}待办{index} 已经变化\n\n"
+            + _enter(conn, chat_id, "todo")
+        )
+
+    marker = "✅ 已完成" if action == "完成" else "🧹 已取消"
+    return f"{marker}：{day}待办{index}\n\n" + _enter(
+        conn, chat_id, "todo"
+    )
+
+
 def handle_command(conn, text, chat_id):
     text = text.strip()
     page = get_page(chat_id, conn=conn)
+
+    todo_action = _handle_todo_action(conn, text, chat_id)
+    if todo_action is not None:
+        return todo_action
 
     match = re.match(r"^确认记忆\s*#?(\d+)\s*$", text)
     if match:
@@ -962,16 +1061,18 @@ def handle_command(conn, text, chat_id):
 
     # -------- 页面内数字 --------
 
-    if text in {"1", "2", "3", "4", "5", "6"}:
-        handled = _handle_page_number(conn, chat_id, page, text)
+    if text.isdigit():
+        handled = None
+        if text in {"1", "2", "3", "4", "5", "6"}:
+            handled = _handle_page_number(conn, chat_id, page, text)
         if handled is not None:
             return handled
         if page != "menu":
-            return (
-                "😅 本页没有这个操作\n\n"
-                "请按当前页面提示输入\n\n"
-                "0 返回"
+            return PAGE_UNKNOWN_HINT.get(
+                page,
+                "😅 本页没有这个数字操作\n0 返回",
             )
+        return "😅 主菜单没有这个编号\n请输入 1 到 6"
 
     # -------- 直接进入页面的文字命令 --------
 
@@ -1018,10 +1119,10 @@ def handle_command(conn, text, chat_id):
         end = _normalize_hhmm(end_text)
 
         if start is None or end is None:
-            return "😅 时间写成 23:00 08:00 这样\n\n6 看播报 · 0 返回"
+            return "😅 时间写成 23:00 08:00 这样\n\n0 返回"
 
         if start == end:
-            return "😅 开始和结束不能一样\n\n6 看播报 · 0 返回"
+            return "😅 开始和结束不能一样\n\n0 返回"
 
         notify_store.set_setting("notify_quiet_start", start)
         notify_store.set_setting("notify_quiet_end", end)
@@ -1029,13 +1130,13 @@ def handle_command(conn, text, chat_id):
         return (
             f"🔇 静音 {start}–{end}\n\n"
             "这段桌宠闭嘴，飞书照常\n\n"
-            "6 看播报 · 0 返回"
+            "0 返回"
         )
 
     if text in {"关闭静音", "取消静音"}:
         notify_store.set_setting("notify_quiet_start", "")
         notify_store.set_setting("notify_quiet_end", "")
-        return "🔔 静音关掉了\n\n6 看播报 · 0 返回"
+        return "🔔 静音关掉了\n\n0 返回"
 
     match = re.match(r"^(关闭|开启)(待办|监控)播报$", text)
 
@@ -1048,7 +1149,7 @@ def handle_command(conn, text, chat_id):
         )
         notify_store.set_setting(key, "1" if action == "开启" else "0")
         state_text = "开启" if action == "开启" else "关闭"
-        return f"✅ {target}播报{state_text}\n\n6 看播报 · 0 返回"
+        return f"✅ {target}播报{state_text}\n\n0 返回"
 
     # -------- 创建待办 --------
 
@@ -1104,17 +1205,18 @@ def handle_command(conn, text, chat_id):
         if not cursor.rowcount:
             return (
                 f"😅 没有 #{todo_id} 这个待办\n\n"
-                "发 2 看看有哪些\n\n"
-                "2 看待办 · 0 返回"
+                "发送：待办"
             )
 
         if action == "取消待办":
             return (
                 f"🧹 #{todo_id} 已移出待办\n\n"
-                + render_todo(conn)
+                + _enter(conn, chat_id, "todo")
             )
 
-        return f"✅ #{todo_id} 完成\n\n" + render_todo(conn)
+        return f"✅ #{todo_id} 完成\n\n" + _enter(
+            conn, chat_id, "todo"
+        )
 
     # -------- 保存记忆 --------
 
@@ -1256,7 +1358,7 @@ def handle_command(conn, text, chat_id):
                 "😅 这个时间不能早于当前时间\n\n"
                 f"现在是 {datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M}\n"
                 "请填写之后的时间\n\n"
-                "3 重填 · 0 返回"
+                "直接按格式重发 · 0 返回"
             )
         if parsed is not None:
             date_text, time_text, title = parsed

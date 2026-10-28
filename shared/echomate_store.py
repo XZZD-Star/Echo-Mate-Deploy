@@ -400,26 +400,51 @@ def _set_todo_status(conn, owner_id, todo_id, status):
     return cursor.rowcount > 0
 
 
-def materialize_due_reminders():
-    """Create one delivery per channel for due pending todos."""
+REMINDER_GRACE_MINUTES = 5
+
+
+def materialize_due_reminders(grace_minutes=REMINDER_GRACE_MINUTES):
+    """Create deliveries only for reminders that are still timely."""
     now = now_utc()
+    grace_cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=grace_minutes)
+    ).isoformat(timespec="seconds")
     with connect() as conn:
+        conn.execute(
+            """
+            UPDATE reminder_deliveries
+            SET status = 'skipped',
+                last_error = 'reminder expired'
+            WHERE status IN ('pending', 'claimed')
+              AND todo_id IN (
+                  SELECT id FROM todos
+                  WHERE status = 'pending'
+                    AND reminded_at_utc IS NULL
+                    AND due_at_utc < ?
+              )
+            """,
+            (grace_cutoff,),
+        )
+        conn.execute(
+            """
+            UPDATE todos SET reminded_at_utc = ?
+            WHERE status = 'pending'
+              AND reminded_at_utc IS NULL
+              AND due_at_utc < ?
+            """,
+            (now, grace_cutoff),
+        )
         rows = conn.execute(
             """
             SELECT id, title, notify_deskbot, notify_feishu
             FROM todos
             WHERE status = 'pending' AND due_at_utc <= ?
               AND reminded_at_utc IS NULL
+              AND due_at_utc >= ?
             ORDER BY due_at_utc ASC LIMIT 50
             """,
-            (now,),
+            (now, grace_cutoff),
         ).fetchall()
-        for row in rows:
-            if not row["notify_deskbot"] and not row["notify_feishu"]:
-                conn.execute(
-                    "UPDATE todos SET reminded_at_utc = ? WHERE id = ?",
-                    (now, row["id"]),
-                )
         created = 0
         for row in rows:
             channels = []
@@ -427,6 +452,12 @@ def materialize_due_reminders():
                 channels.append("deskbot")
             if row["notify_feishu"]:
                 channels.append("feishu")
+            if not channels:
+                conn.execute(
+                    "UPDATE todos SET reminded_at_utc = ? WHERE id = ?",
+                    (now, row["id"]),
+                )
+                continue
             for channel in channels:
                 cursor = conn.execute(
                     """
@@ -457,6 +488,10 @@ def pending_deskbot_deliveries():
 
 
 def claim_delivery(channel):
+    grace_cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(minutes=REMINDER_GRACE_MINUTES)
+    ).isoformat(timespec="seconds")
     with connect() as conn:
         row = conn.execute(
             """
@@ -466,9 +501,11 @@ def claim_delivery(channel):
             JOIN todos t ON t.id = d.todo_id
             WHERE d.channel = ? AND d.status = 'pending'
               AND t.status = 'pending'
+              AND t.reminded_at_utc IS NULL
+              AND t.due_at_utc >= ?
             ORDER BY d.id ASC LIMIT 1
             """,
-            (channel,),
+            (channel, grace_cutoff),
         ).fetchone()
         if not row:
             return None
@@ -499,6 +536,19 @@ def mark_delivery(delivery_id, status, error=None):
             (status, status, now_utc(), (str(error)[:300] if error else None),
              int(delivery_id)),
         )
+        if status in ("sent", "skipped"):
+            row = conn.execute(
+                "SELECT todo_id FROM reminder_deliveries WHERE id = ?",
+                (int(delivery_id),),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    UPDATE todos SET reminded_at_utc = ?
+                    WHERE id = ? AND reminded_at_utc IS NULL
+                    """,
+                    (now_utc(), row["todo_id"]),
+                )
 
 
 def acknowledge_delivery(delivery_id):

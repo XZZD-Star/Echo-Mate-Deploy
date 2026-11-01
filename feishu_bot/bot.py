@@ -200,10 +200,15 @@ PAGE_PARENT = {
 def default_nav_stack(page):
     if page == "menu":
         return ["menu"]
-    parent = PAGE_PARENT.get(page, "menu")
-    if parent == "menu":
-        return ["menu", page]
-    return ["menu", parent, page]
+    stack = [page]
+    seen = {page}
+    while stack[0] != "menu":
+        parent = PAGE_PARENT.get(stack[0], "menu")
+        if parent in seen:
+            return ["menu", page]
+        stack.insert(0, parent)
+        seen.add(parent)
+    return stack
 
 
 def state_nav_stack(state):
@@ -212,8 +217,13 @@ def state_nav_stack(state):
     if (
         isinstance(stack, list)
         and stack
+        and stack[0] == "menu"
         and all(item in PAGES for item in stack)
         and stack[-1] == page
+        and all(
+            PAGE_PARENT.get(stack[index], "menu") == stack[index - 1]
+            for index in range(1, len(stack))
+        )
     ):
         return stack
     return default_nav_stack(page)
@@ -226,21 +236,21 @@ PAGE_UNKNOWN_HINT = {
         "这里没有这个数字操作\n"
         "完成：完成 今天待办1\n"
         "取消：取消 明天待办1\n"
-        "0 返回"
+        "8 上一页 · 9 下一页 · 0 返回"
     ),
     "todo_new": "这里需要直接填写待办内容\n0 返回",
-    "todo_history": "这里没有这个数字操作\n0 返回",
-    "memory": "这里没有这个编号\n1 查看全部 · 0 返回",
+    "todo_history": "8 上一页 · 9 下一页 · 0 返回",
+    "memory": "8 上一页 · 9 下一页 · 0 返回",
     "help": "帮助页可直接回复 0 返回",
     "notify": "这里没有这个编号\n请选择 1 到 4，或回复 0 返回",
     "quiet": "静音页请直接发送设置命令\n0 返回",
-    "records": "播报记录页没有数字操作\n0 返回",
+    "records": "8 上一页 · 9 下一页 · 0 返回",
     "memory_clear_confirm": "请发送“确认清空记忆”或 0 返回",
     "pc": "这里没有这个编号\n请选择 1 到 3，或回复 0 返回",
     "pc_single": "请直接发送一条任务\n0 取消",
     "pc_fixed": "请直接发送任务，或选择页面上的编号\n0 返回",
     "pc_fixed_new": "请直接发送第一条任务\n0 取消",
-    "pc_history": "请发送任务编号查看详情\n0 返回",
+    "pc_history": "1-6 查看详情 · 8 上一页 · 9 下一页 · 0 返回",
     "pc_history_detail": "任务详情页可直接回复 0 返回",
 }
 
@@ -292,10 +302,47 @@ SERVICE_UNITS = [
 BACKUP_UNIT = ("echomate-db-backup.timer", "数据库备份", "echomate-db-backup")
 
 PAGE_TTL_SECONDS = 86400
+PAGED_PAGE_SIZES = {
+    "todo": 8,
+    "todo_history": 8,
+    "memory": 5,
+    "records": 8,
+    "pc_history": 6,
+}
 
 
 def page_key(chat_id):
     return f"menu:{chat_id}"
+
+
+def _page_count(total, page_size):
+    return max(1, (max(0, total) + page_size - 1) // page_size)
+
+
+def _clamp_page(page_index, total, page_size):
+    index = max(1, int(page_index or 1))
+    return min(index, _page_count(total, page_size))
+
+
+def _pager_lines(page_index, total, page_size, extra=None):
+    pages = _page_count(total, page_size)
+    lines = []
+    if extra:
+        lines.append(extra)
+    lines.extend([
+        f"第 {page_index}/{pages} 页 · 共 {total} 条",
+        "8 上一页 · 9 下一页 · 0 返回",
+    ])
+    return lines
+
+
+def _pager_state(page_index, total, page_size, item_ids):
+    return {
+        "page_index": page_index,
+        "page_size": page_size,
+        "total": total,
+        "item_ids": item_ids,
+    }
 
 
 def _read_setting(conn, key, default=""):
@@ -359,6 +406,24 @@ def get_page_state(chat_id, conn=None):
         return {"page": "menu"}
 
     data["page"] = page
+    if page in PAGED_PAGE_SIZES:
+        pager = data.get("pager")
+        if not isinstance(pager, dict):
+            pager = {}
+        pager["page_size"] = PAGED_PAGE_SIZES[page]
+        try:
+            pager["page_index"] = max(
+                1, int(pager.get("page_index", 1))
+            )
+        except (TypeError, ValueError):
+            pager["page_index"] = 1
+        try:
+            pager["total"] = max(0, int(pager.get("total", 0)))
+        except (TypeError, ValueError):
+            pager["total"] = 0
+        ids = pager.get("item_ids")
+        pager["item_ids"] = ids if isinstance(ids, list) else []
+        data["pager"] = pager
     return data
 
 
@@ -589,7 +654,7 @@ def _todo_window():
     return start, end
 
 
-def _todo_rows(conn, limit=20):
+def _todo_rows(conn, limit=200):
     start, end = _todo_window()
     return conn.execute(
         """
@@ -604,8 +669,14 @@ def _todo_rows(conn, limit=20):
     ).fetchall()
 
 
-def _build_todo_page(conn):
-    rows = _todo_rows(conn)
+def _build_todo_page(conn, page_index=1):
+    all_rows = _todo_rows(conn)
+    total = len(all_rows)
+    page_size = PAGED_PAGE_SIZES["todo"]
+    page_index = _clamp_page(page_index, total, page_size)
+    rows = all_rows[
+        (page_index - 1) * page_size:page_index * page_size
+    ]
 
     if not rows:
         reply = (
@@ -613,9 +684,14 @@ def _build_todo_page(conn):
             "今天和明天都没有待办，休息一下吧 ☕\n\n"
             "3 新建待办\n"
             "4 历史待办\n"
-            "0 返回"
+            + "\n".join(_pager_lines(page_index, total, page_size))
         )
-        return reply, {"day_key": datetime.now(LOCAL_TZ).date().isoformat()}
+        return reply, {
+            "day_key": datetime.now(LOCAL_TZ).date().isoformat(),
+            "today_ids": [],
+            "tomorrow_ids": [],
+            "pager": _pager_state(page_index, total, page_size, []),
+        }
 
     today = datetime.now(LOCAL_TZ).date()
     groups = {"今天": [], "明天": []}
@@ -650,12 +726,18 @@ def _build_todo_page(conn):
         "",
         "📜 4 历史待办",
         "➕ 3 新建待办",
-        "0 返回",
+        *_pager_lines(page_index, total, page_size),
     ])
     state = {
         "day_key": today.isoformat(),
         "today_ids": [row["id"] for row in groups["今天"]],
         "tomorrow_ids": [row["id"] for row in groups["明天"]],
+        "pager": _pager_state(
+            page_index,
+            total,
+            page_size,
+            [row["id"] for row in rows],
+        ),
     }
     return "\n".join(lines), state
 
@@ -664,48 +746,88 @@ def render_todo(conn):
     return _build_todo_page(conn)[0]
 
 
-def render_todo_history(conn, limit=20):
-    today = datetime.now(LOCAL_TZ).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    today_utc = today.astimezone(timezone.utc).isoformat(
-        timespec="seconds"
-    )
-    rows = conn.execute(
+def _build_todo_history_page(conn, page_index=1):
+    now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    page_size = PAGED_PAGE_SIZES["todo_history"]
+    total = conn.execute(
         """
-        SELECT id, title, due_at_utc, status, reminded_at_utc
+        SELECT COUNT(*)
         FROM todos
         WHERE owner_id = ?
           AND (
-              status = 'completed'
+              status IN ('completed', 'cancelled')
+              OR (status = 'pending' AND due_at_utc < ?)
+          )
+        """,
+        (OWNER_OPEN_ID, now_utc),
+    ).fetchone()[0]
+
+    if not total:
+        return (
+            "📜 历史待办\n\n还没有已完成或过期的待办\n\n0 返回",
+            {"pager": _pager_state(1, 0, page_size, [])},
+        )
+
+    page_index = _clamp_page(page_index, total, page_size)
+    rows = conn.execute(
+        """
+        SELECT id, title, due_at_utc, status
+        FROM todos
+        WHERE owner_id = ?
+          AND (
+              status IN ('completed', 'cancelled')
               OR (status = 'pending' AND due_at_utc < ?)
           )
         ORDER BY due_at_utc DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
         """,
-        (OWNER_OPEN_ID, today_utc, limit),
+        (
+            OWNER_OPEN_ID,
+            now_utc,
+            page_size,
+            (page_index - 1) * page_size,
+        ),
     ).fetchall()
 
-    if not rows:
-        return "📜 历史待办\n\n还没有已完成或过期的待办\n\n0 返回"
-
     lines = ["📜 历史待办", ""]
+    current_day = None
     for row in rows:
         due = datetime.fromisoformat(
             row["due_at_utc"]
         ).astimezone(LOCAL_TZ)
+        day = due.strftime("%m-%d")
+        if day != current_day:
+            if len(lines) > 2 and lines[-1]:
+                lines.append("")
+            lines.append(day)
+            current_day = day
         if row["status"] == "completed":
             mark = "✅ 已完成"
-        elif row["reminded_at_utc"]:
-            mark = "⏰ 已提醒"
+        elif row["status"] == "cancelled":
+            mark = "🧹 已取消"
         else:
             mark = "⌛ 已过期"
         lines.append(
-            f"{mark} · {due:%m-%d %H:%M} · {row['title']}"
+            f"{mark} · {due:%H:%M} · {row['title'][:50]}"
         )
 
-    lines.extend(["", "0 返回"])
-    return "\n".join(lines)
+    lines.extend([
+        "",
+        *_pager_lines(page_index, total, page_size),
+    ])
+    item_ids = [row["id"] for row in rows]
+    return "\n".join(lines), {
+        "pager": _pager_state(
+            page_index, total, page_size, item_ids
+        ),
+        "history_ids": item_ids,
+    }
+
+
+def render_todo_history(conn, page_index=1):
+    return _build_todo_history_page(
+        conn, page_index=page_index
+    )[0]
 
 
 def render_todo_new():
@@ -720,16 +842,16 @@ def render_todo_new():
     )
 
 
-def _memory_rows(conn, limit):
+def _memory_rows(conn, limit, offset=0):
     return conn.execute(
         """
         SELECT id, content
         FROM memories
         WHERE owner_id = ?
         ORDER BY id DESC
-        LIMIT ?
+        LIMIT ? OFFSET ?
         """,
-        (OWNER_OPEN_ID, limit),
+        (OWNER_OPEN_ID, limit, offset),
     ).fetchall()
 
 
@@ -743,42 +865,51 @@ def _memory_candidate_display_index(conn, candidate_id):
     return 1
 
 
-def render_memory(conn, show_all=False):
+def _build_memory_page(conn, page_index=1):
     total = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE owner_id = ?",
         (OWNER_OPEN_ID,),
     ).fetchone()[0]
+    page_size = PAGED_PAGE_SIZES["memory"]
 
     if not total:
         return (
-            "📚 记忆\n\n"
-            "还没有记忆\n\n"
+            "📚 记忆\n\n还没有记忆\n\n"
             "💾 存记忆：记住 喜欢简短回答\n\n"
-            "0 返回"
+            "0 返回",
+            {"pager": _pager_state(1, 0, page_size, [])},
         )
 
-    rows = _memory_rows(conn, 30 if show_all else 3)
+    page_index = _clamp_page(page_index, total, page_size)
+    rows = _memory_rows(
+        conn,
+        page_size,
+        (page_index - 1) * page_size,
+    )
+    memory_ids = [row[0] for row in rows]
 
     lines = [f"📚 记忆 · {total} 条", ""]
     for sequence, (_, content) in enumerate(rows, 1):
         lines.append(f"{sequence}. {content[:60]}")
-
-    if not show_all and total > len(rows):
-        lines.append(f"\n…还有 {total - len(rows)} 条")
 
     lines.extend([
         "",
         "🔎 查记忆：查记忆 服务器",
         "💾 存记忆：记住 喜欢简短回答",
         "🗑 删除记忆：删除第 1 条",
+        "",
+        *_pager_lines(page_index, total, page_size),
     ])
+    return "\n".join(lines), {
+        "pager": _pager_state(
+            page_index, total, page_size, memory_ids
+        ),
+        "memory_ids": memory_ids,
+    }
 
-    if show_all:
-        lines.extend(["", "0 返回"])
-    else:
-        lines.extend(["", "1 查看全部", "0 返回"])
 
-    return "\n".join(lines)
+def render_memory(conn, page_index=1):
+    return _build_memory_page(conn, page_index=page_index)[0]
 
 
 def render_help():
@@ -864,11 +995,31 @@ def render_quiet():
     )
 
 
-def render_records():
-    rows = notify_store.recent_records(10)
+def _record_total():
+    conn = open_connection(DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM notify_outbox"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
 
-    if not rows:
-        return "📢 播报记录\n\n还没有记录\n\n0 返回"
+
+def _build_records_page(page_index=1):
+    total = _record_total()
+    page_size = PAGED_PAGE_SIZES["records"]
+
+    if not total:
+        return (
+            "📢 播报记录\n\n还没有记录\n\n0 返回",
+            {"pager": _pager_state(1, 0, page_size, [])},
+        )
+
+    page_index = _clamp_page(page_index, total, page_size)
+    offset = (page_index - 1) * page_size
+    rows = notify_store.recent_records(offset + page_size + 1)
+    rows = rows[offset:offset + page_size]
 
     status_label = {
         "pending": "等待播报",
@@ -891,8 +1042,22 @@ def render_records():
             f"{sequence}. {_kind_label(row['kind'])} · {mark}"
         )
 
-    lines.extend(["", "0 返回"])
-    return "\n".join(lines)
+    lines.extend([
+        "",
+        *_pager_lines(page_index, total, page_size),
+    ])
+    return "\n".join(lines), {
+        "pager": _pager_state(
+            page_index,
+            total,
+            page_size,
+            [row["id"] for row in rows],
+        ),
+    }
+
+
+def render_records(page_index=1):
+    return _build_records_page(page_index=page_index)[0]
 
 
 def build_page_card(page, text):
@@ -962,7 +1127,7 @@ def build_page_card(page, text):
     }
 
 
-def render_page(conn, chat_id, page):
+def render_page(conn, chat_id, page, page_index=1):
     if page == "menu":
         return menu_text()
     if page == "status":
@@ -970,13 +1135,13 @@ def render_page(conn, chat_id, page):
     if page == "status_detail":
         return render_status_detail()
     if page == "todo":
-        return render_todo(conn)
+        return _build_todo_page(conn, page_index)[0]
     if page == "todo_new":
         return render_todo_new()
     if page == "todo_history":
-        return render_todo_history(conn)
+        return _build_todo_history_page(conn, page_index)[0]
     if page == "memory":
-        return render_memory(conn)
+        return _build_memory_page(conn, page_index)[0]
     if page == "help":
         return render_help()
     if page == "notify":
@@ -984,7 +1149,7 @@ def render_page(conn, chat_id, page):
     if page == "quiet":
         return render_quiet()
     if page == "records":
-        return render_records()
+        return _build_records_page(page_index)[0]
     if page == "memory_clear_confirm":
         return (
             "⚠️ 清空全部记忆？\n\n"
@@ -1019,7 +1184,7 @@ def _kind_label(kind):
     }.get(kind, kind)
 
 
-def _build_pc_page(conn, chat_id, page):
+def _build_pc_page(conn, chat_id, page, page_index=1):
     if not _pc_control_enabled(conn):
         return "🖥 本机 Codex 暂时关闭\n\n0 返回", {}
 
@@ -1057,11 +1222,33 @@ def _build_pc_page(conn, chat_id, page):
             turn_count,
         ), {}
     if page == "pc_history":
+        page_size = PAGED_PAGE_SIZES["pc_history"]
+        total = conn.execute(
+            """
+            SELECT COUNT(*) FROM pc_jobs
+            WHERE owner_id = ? AND chat_id = ?
+            """,
+            (OWNER_OPEN_ID, chat_id),
+        ).fetchone()[0]
+        page_index = _clamp_page(page_index, total, page_size)
         rows = pc_control_store.list_history(
-            OWNER_OPEN_ID, chat_id, limit=10, conn=conn
+            OWNER_OPEN_ID,
+            chat_id,
+            limit=(page_index * page_size) + 1,
+            conn=conn,
         )
-        return pc_pages.render_pc_history(rows), {
-            "history_job_ids": [row["id"] for row in rows]
+        offset = (page_index - 1) * page_size
+        rows = rows[offset:offset + page_size]
+        return pc_pages.render_pc_history(
+            rows, page_index, total, page_size
+        ), {
+            "history_job_ids": [row["id"] for row in rows],
+            "pager": _pager_state(
+                page_index,
+                total,
+                page_size,
+                [row["id"] for row in rows],
+            ),
         }
     if page == "pc_history_detail":
         state = get_page_state(chat_id, conn=conn)
@@ -1075,14 +1262,24 @@ def _build_pc_page(conn, chat_id, page):
     return "🖥 本机 Codex\n\n0 返回", {}
 
 
-def _render_page_state(conn, chat_id, page):
+def _render_page_state(conn, chat_id, page, page_index=1):
     state = None
     if page == "todo":
-        reply, state = _build_todo_page(conn)
+        reply, state = _build_todo_page(conn, page_index)
+    elif page == "todo_history":
+        reply, state = _build_todo_history_page(
+            conn, page_index
+        )
+    elif page == "memory":
+        reply, state = _build_memory_page(conn, page_index)
+    elif page == "records":
+        reply, state = _build_records_page(page_index)
     elif page in PC_PAGES:
-        reply, state = _build_pc_page(conn, chat_id, page)
+        reply, state = _build_pc_page(
+            conn, chat_id, page, page_index
+        )
     else:
-        reply = render_page(conn, chat_id, page)
+        reply = render_page(conn, chat_id, page, page_index)
     return reply, state or {}
 
 
@@ -1102,7 +1299,10 @@ def _enter(conn, chat_id, page, mode="push"):
     elif current_page != page:
         stack = stack + [page]
 
-    reply, extra_state = _render_page_state(conn, chat_id, page)
+    stack = state_nav_stack({"page": page, "nav_stack": stack})
+    reply, extra_state = _render_page_state(
+        conn, chat_id, page, page_index=1
+    )
     extra_state["nav_stack"] = stack
     set_page(chat_id, page, state=extra_state, conn=conn)
     return reply
@@ -1118,10 +1318,53 @@ def _navigate_back(conn, chat_id):
     target = stack[-2]
     _pause_pc_session_for_navigation(conn, chat_id, current_page, target)
     next_stack = stack[:-1]
-    reply, extra_state = _render_page_state(conn, chat_id, target)
+    reply, extra_state = _render_page_state(
+        conn, chat_id, target, page_index=1
+    )
     extra_state["nav_stack"] = next_stack
     set_page(chat_id, target, state=extra_state, conn=conn)
     return reply
+
+
+def _open_page_index(conn, chat_id, page_index):
+    state = get_page_state(chat_id, conn=conn)
+    page = state.get("page", "menu")
+    stack = state_nav_stack(state)
+    reply, extra_state = _render_page_state(
+        conn, chat_id, page, page_index=page_index
+    )
+    extra_state["nav_stack"] = stack
+    set_page(chat_id, page, state=extra_state, conn=conn)
+    return reply
+
+
+def _handle_pagination(conn, chat_id, text):
+    state = get_page_state(chat_id, conn=conn)
+    page = state.get("page", "menu")
+    if page not in PAGED_PAGE_SIZES:
+        return None
+    pager = state.get("pager") or {}
+    current = max(1, int(pager.get("page_index", 1)))
+    total = max(0, int(pager.get("total", 0)))
+    page_size = PAGED_PAGE_SIZES[page]
+    pages = _page_count(total, page_size)
+    target = current
+
+    if text in {"8", "上一页"}:
+        target = current - 1
+    elif text in {"9", "下一页"}:
+        target = current + 1
+    else:
+        match = re.match(r"^第\s*(\d+)\s*页$", text)
+        if not match:
+            return None
+        target = int(match.group(1))
+
+    if target < 1:
+        return "已经是第一页\n\n0 返回"
+    if target > pages:
+        return "已经是最后一页\n\n0 返回"
+    return _open_page_index(conn, chat_id, target)
 
 
 def _toggle(kind_key, target):
@@ -1164,10 +1407,6 @@ def _handle_page_number(conn, chat_id, page, text):
             return _enter(conn, chat_id, "todo_new")
         if text == "4":
             return _enter(conn, chat_id, "todo_history")
-
-    elif page == "memory":
-        if text == "1":
-            return render_memory(conn, show_all=True)
 
     elif page == "notify":
         if text == "1":
@@ -1594,7 +1833,18 @@ def _handle_todo_action(conn, text, chat_id):
 
 def handle_command(conn, text, chat_id, event_id=None):
     text = text.strip()
+
+    # Global escape commands must work from every page, including PC capture.
+    if text in {"菜单", "功能"}:
+        return _enter(conn, chat_id, "menu", mode="reset")
+    if text == "0":
+        return _navigate_back(conn, chat_id)
+
     page = get_page(chat_id, conn=conn)
+
+    paged = _handle_pagination(conn, chat_id, text)
+    if paged is not None:
+        return paged
 
     if page in PC_PAGES:
         return _handle_pc_context(
@@ -1655,14 +1905,6 @@ def handle_command(conn, text, chat_id, event_id=None):
             "取消：取消候选 1",
         ])
         return "\n".join(lines)
-
-    # -------- 全局导航 --------
-
-    if text in {"菜单", "功能"}:
-        return _enter(conn, chat_id, "menu", mode="reset")
-
-    if text == "0":
-        return _navigate_back(conn, chat_id)
 
     # -------- 页面内数字 --------
 
@@ -1900,19 +2142,18 @@ def handle_command(conn, text, chat_id, event_id=None):
     match = re.match(r"^删除第\s*(\d+)\s*条(?:记忆)?$", text)
     if match:
         display_index = int(match.group(1))
+        state = get_page_state(chat_id, conn=conn)
+        memory_ids = state.get("memory_ids") or []
+        if display_index < 1 or display_index > len(memory_ids):
+            return "没有找到这条记忆\n\n4 看记忆 · 0 返回"
+        memory_id = int(memory_ids[display_index - 1])
         row = conn.execute(
-            """
-            SELECT id, content
-            FROM memories
-            WHERE owner_id = ?
-            ORDER BY id DESC
-            LIMIT 1 OFFSET ?
-            """,
-            (OWNER_OPEN_ID, max(0, display_index - 1)),
+            "SELECT content FROM memories WHERE id = ? AND owner_id = ?",
+            (memory_id, OWNER_OPEN_ID),
         ).fetchone()
         if row is None:
             return "没有找到这条记忆\n\n4 看记忆 · 0 返回"
-        memory_id, content = row[0], row[1]
+        content = row[0]
         if not echomate_store.delete_memory(
             OWNER_OPEN_ID, memory_id, conn=conn
         ):

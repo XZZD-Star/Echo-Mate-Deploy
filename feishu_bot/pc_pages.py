@@ -160,7 +160,7 @@ def render_pc_job_status(job):
     return "\n".join(lines)
 
 
-def render_pc_history(rows):
+def render_pc_history(rows, page_index=1, total=0, page_size=6):
     if not rows:
         return "📜 本机任务历史\n\n还没有任务记录\n\n0 · 返回"
 
@@ -171,7 +171,13 @@ def render_pc_history(rows):
             f"{index} · {short_text(row['prompt'], 26)}"
             f" · {status}"
         )
-    lines.extend(["", "发送编号查看详情", "0 · 返回"])
+    pages = max(1, (total + page_size - 1) // page_size)
+    lines.extend([
+        "",
+        "发送编号查看详情",
+        f"第 {page_index}/{pages} 页 · 共 {total} 条",
+        "8 上一页 · 9 下一页 · 0 · 返回",
+    ])
     return "\n".join(lines)
 
 

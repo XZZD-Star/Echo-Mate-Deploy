@@ -68,6 +68,16 @@ class MenuUITest(unittest.TestCase):
             self.assertTrue(bot.send_page_card("chat", "status", "body"))
             fallback.assert_called_once_with("chat", "body")
 
+    def test_pager_labels_are_consistent(self):
+        lines = bot._pager_lines(2, 18, 8)
+        self.assertEqual(
+            lines,
+            [
+                "第 2/3 页 · 共 18 条",
+                "8 上一页 · 9 下一页 · 0 返回",
+            ],
+        )
+
     def test_main_menu_and_help_keep_primary_entries(self):
         menu = bot.menu_text()
         help_text = bot.render_help()
@@ -109,7 +119,10 @@ class MenuUITest(unittest.TestCase):
                 "last_error": None,
             },
         ]
-        with patch("bot.notify_store.recent_records", return_value=rows):
+        with patch("bot._record_total", return_value=2), patch(
+            "bot.notify_store.recent_records",
+            return_value=rows,
+        ):
             records = bot.render_records()
 
         self.assertIn("待办提醒　已开启", notify)

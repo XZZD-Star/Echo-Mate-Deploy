@@ -43,6 +43,18 @@ with tempfile.TemporaryDirectory() as temp_dir:
         assert "这里没有这个编号" in reply
         assert bot.get_page(chat_id, conn=conn) == "pc"
 
+        reply = bot.handle_command(
+            conn, "菜单", chat_id, event_id="route-menu"
+        )
+        assert "Echo-Mate" in reply
+        assert bot.get_page(chat_id, conn=conn) == "menu"
+
+        reply = bot.handle_command(
+            conn, "7", chat_id, event_id="route-reenter"
+        )
+        assert "本机 Codex" in reply
+        assert bot.get_page(chat_id, conn=conn) == "pc"
+
         reply = bot.handle_command(conn, "1", chat_id, event_id="route-3")
         assert "单次任务" in reply
         assert bot.get_page(chat_id, conn=conn) == "pc_single"

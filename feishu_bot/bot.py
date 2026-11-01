@@ -268,6 +268,7 @@ PAGE_CARD_CONFIG = {
 PAGE_CARD_DROP_FIRST = {
     "🐣 Echo-Mate",
     "🔍 状态详情",
+    "🧰 Echo-Mate 系统详情",
     "➕ 新建待办",
     "📜 历史待办",
     "💡 帮助",
@@ -411,6 +412,17 @@ def _unit_state_text(state):
     return state
 
 
+def _unit_dot(state):
+    return "🟢" if state == "active" else "🔴"
+
+
+def _format_bytes(value):
+    gib = value / 1024**3
+    if gib >= 1:
+        return f"{gib:.1f} GB".replace(".0 GB", " GB")
+    return f"{value / 1024**2:.0f} MB"
+
+
 def _service_states():
     """返回 [(中文标签, systemd 状态, unit 简名), ...]。"""
     return [
@@ -462,39 +474,51 @@ def render_status():
     active_count = sum(state == "active" for _, state, _ in states)
 
     if down:
-        head = "⚠️ 有服务异常"
+        lines = [
+            "🛠️ Echo-Mate 需要看一眼",
+            "",
+            f"有 {len(down)} 个核心服务异常",
+        ]
+        lines.extend(
+            f"🔴 {label}"
+            for label, state, _ in states
+            if state != "active"
+        )
+        normal_count = len(states) - len(down)
+        if normal_count:
+            lines.append(f"其余 {normal_count} 个核心服务正常")
     elif cpu > 90 or mem.available < 250 * 1024**2:
-        head = "⚠️ 当前负载较高"
+        lines = [
+            "😮‍💨 当前稍微有点忙",
+            "",
+            f"CPU 正在加班，暂时 {cpu:.0f}%",
+            f"{len(states)} 个核心服务都在线",
+        ]
     elif backup_state != "active":
-        head = "⚠️ 备份任务异常"
+        lines = [
+            "🗃️ 备份任务需要检查",
+            "",
+            f"{len(states)} 个核心服务都在线",
+            "数据库备份没有正常运行",
+        ]
     else:
-        head = "✅ 运行正常"
+        lines = [
+            "✅ 一切正常，今天也稳稳在线",
+            "",
+            f"{active_count} 个核心服务都在线",
+        ]
 
-    lines = [
-        head,
-        "",
-        f"核心服务 {active_count}/{len(states)}",
-    ]
-    lines.extend(
-        f"{label}  {_unit_state_text(state)}"
-        for label, state, _ in states
-    )
     lines.extend([
         "",
-        "定时任务",
-        f"{BACKUP_UNIT[1]}  {_unit_state_text(backup_state)}",
+        "🗃️ 备份任务",
+        f"{_unit_dot(backup_state)} {_unit_state_text(backup_state)}",
         "",
-        "资源",
-        f"CPU  {cpu:.0f}%",
-        f"可用内存  {mem.available / 1024**2:.0f}M",
-        f"剩余磁盘  {disk.free / 1024**3:.0f}G",
-        f"运行时长  {_uptime_text()}",
+        "📊 资源余量",
+        f"CPU：{cpu:.0f}%",
+        f"可用内存：{_format_bytes(mem.available)}",
+        f"剩余磁盘：{_format_bytes(disk.free)}",
+        f"已稳定运行：{_uptime_text()}",
     ])
-
-    if down:
-        lines.extend(["", "异常：" + "、".join(down)])
-    if backup_state != "active":
-        lines.extend(["", f"异常：{BACKUP_UNIT[1]}"])
 
     lines.append("")
     lines.append("1 刷新 · 2 详情 · 0 返回")
@@ -513,24 +537,40 @@ def render_status_detail():
     backup_state = _unit_state(BACKUP_UNIT[0])
 
     lines = [
-        "🔍 状态详情",
+        "🧰 Echo-Mate 系统详情",
         "",
-        f"🖥 {os.uname().nodename}",
-        f"⏱ 开机 {boot:%Y-%m-%d %H:%M:%S}",
-        f"📈 已跑 {_uptime_text()}",
+        "🖥 主机",
+        os.uname().nodename,
         "",
-        f"CPU {cpu:.0f}% · {psutil.cpu_count()} 核",
-        f"内存 {mem.used / 1024**2:.0f}M / {mem.total / 1024**3:.1f}G",
-        f"Swap {swap.used / 1024**2:.0f}M / {swap.total / 1024**3:.1f}G",
-        f"磁盘 {disk.used / 1024**3:.0f}G / {disk.total / 1024**3:.0f}G",
+        "⏱ 运行情况",
+        f"已稳定运行：{_uptime_text()}",
+        f"最近开机：{boot:%m-%d %H:%M}",
         "",
+        "🔧 核心服务",
     ]
 
     for label, state, _ in states:
-        lines.append(f"{label}  {_unit_state_text(state)}")
+        suffix = "" if state == "active" else " · 异常"
+        lines.append(f"{_unit_dot(state)} {label}{suffix}")
 
+    lines.extend([
+        "",
+        "🗃️ 定时任务",
+        f"{_unit_dot(backup_state)} {BACKUP_UNIT[1]}",
+        "",
+        "📊 资源",
+        f"CPU：{cpu:.0f}% · {psutil.cpu_count()} 核",
+        f"内存：{_format_bytes(mem.used)} / {_format_bytes(mem.total)}",
+    ])
+    if swap.used:
+        lines.append(
+            f"交换空间：{_format_bytes(swap.used)} / "
+            f"{_format_bytes(swap.total)}"
+        )
+    else:
+        lines.append("交换空间：未使用")
     lines.append(
-        f"{BACKUP_UNIT[1]}  {_unit_state_text(backup_state)}"
+        f"磁盘：{_format_bytes(disk.used)} / {_format_bytes(disk.total)}"
     )
 
     lines.extend(["", "1 刷新 · 0 返回"])

@@ -403,6 +403,14 @@ def _unit_state(unit):
         return "unknown"
 
 
+def _unit_state_text(state):
+    if state == "active":
+        return "正常"
+    if state in {"inactive", "failed", "unknown"}:
+        return "异常"
+    return state
+
+
 def _service_states():
     """返回 [(中文标签, systemd 状态, unit 简名), ...]。"""
     return [
@@ -454,37 +462,39 @@ def render_status():
     active_count = sum(state == "active" for _, state, _ in states)
 
     if down:
-        head = "⚠️ 有服务未运行"
+        head = "⚠️ 有服务异常"
     elif cpu > 90 or mem.available < 250 * 1024**2:
         head = "⚠️ 当前负载较高"
     elif backup_state != "active":
-        head = "⚠️ 备份计划未运行"
+        head = "⚠️ 备份任务异常"
     else:
         head = "✅ 运行正常"
 
     lines = [
         head,
         "",
-        f"核心服务 {active_count}/{len(states)} 正常",
-        f"CPU {cpu:.0f}% · 可用内存 {mem.available / 1024**2:.0f}M"
-        f" · 剩余磁盘 {disk.free / 1024**3:.0f}G",
-        f"运行 {_uptime_text()} · 开机 {_boot_text()}",
-        "",
-        " · ".join(
-            f"{label} {'🟢' if state == 'active' else '🔴'}"
-            for label, state, _ in states[:3]
-        ),
-        " · ".join(
-            f"{label} {'🟢' if state == 'active' else '🔴'}"
-            for label, state, _ in states[3:]
-        ),
-        f"{BACKUP_UNIT[1]} {'🟢' if backup_state == 'active' else '🔴'}",
+        f"核心服务 {active_count}/{len(states)}",
     ]
+    lines.extend(
+        f"{label}  {_unit_state_text(state)}"
+        for label, state, _ in states
+    )
+    lines.extend([
+        "",
+        "定时任务",
+        f"{BACKUP_UNIT[1]}  {_unit_state_text(backup_state)}",
+        "",
+        "资源",
+        f"CPU  {cpu:.0f}%",
+        f"可用内存  {mem.available / 1024**2:.0f}M",
+        f"剩余磁盘  {disk.free / 1024**3:.0f}G",
+        f"运行时长  {_uptime_text()}",
+    ])
 
     if down:
-        lines.append("未运行：" + "、".join(down))
+        lines.extend(["", "异常：" + "、".join(down)])
     if backup_state != "active":
-        lines.append(f"未运行：{BACKUP_UNIT[1]}")
+        lines.extend(["", f"异常：{BACKUP_UNIT[1]}"])
 
     lines.append("")
     lines.append("1 刷新 · 2 详情 · 0 返回")
@@ -516,13 +526,11 @@ def render_status_detail():
         "",
     ]
 
-    for label, state, short in states:
-        icon = "🟢" if state == "active" else "🔴"
-        lines.append(f"{label} {icon} {state} · {short}")
+    for label, state, _ in states:
+        lines.append(f"{label}  {_unit_state_text(state)}")
 
-    backup_icon = "🟢" if backup_state == "active" else "🔴"
     lines.append(
-        f"{BACKUP_UNIT[1]} {backup_icon} {backup_state} · {BACKUP_UNIT[2]}"
+        f"{BACKUP_UNIT[1]}  {_unit_state_text(backup_state)}"
     )
 
     lines.extend(["", "1 刷新 · 0 返回"])
@@ -685,6 +693,16 @@ def _memory_rows(conn, limit):
     ).fetchall()
 
 
+def _memory_candidate_display_index(conn, candidate_id):
+    candidates = echomate_store.list_memory_candidates(
+        OWNER_OPEN_ID, 10, conn=conn
+    )
+    for index, item in enumerate(candidates, 1):
+        if item["id"] == candidate_id:
+            return index
+    return 1
+
+
 def render_memory(conn, show_all=False):
     total = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE owner_id = ?",
@@ -702,8 +720,8 @@ def render_memory(conn, show_all=False):
     rows = _memory_rows(conn, 30 if show_all else 3)
 
     lines = [f"📚 记忆 · {total} 条", ""]
-    for sequence, (memory_id, content) in enumerate(rows, 1):
-        lines.append(f"{sequence}. #{memory_id}  {content[:60]}")
+    for sequence, (_, content) in enumerate(rows, 1):
+        lines.append(f"{sequence}. {content[:60]}")
 
     if not show_all and total > len(rows):
         lines.append(f"\n…还有 {total - len(rows)} 条")
@@ -712,7 +730,7 @@ def render_memory(conn, show_all=False):
         "",
         "🔎 查记忆：查记忆 服务器",
         "💾 存记忆：记住 喜欢简短回答",
-        f"🗑 删除记忆：删除记忆 {rows[0][0]}",
+        "🗑 删除记忆：删除第 1 条",
     ])
 
     if show_all:
@@ -736,7 +754,7 @@ def render_help():
         "📚 记忆\n"
         "💾 存记忆：记住 喜欢简短回答\n"
         "🔎 查记忆：查记忆 服务器\n"
-        "🗑 删除记忆：删除记忆 12\n\n"
+        "🗑 删除记忆：删除第 1 条\n\n"
         "🔊 播报\n"
         "🌙 设置静音：静音 23:00 08:00\n"
         "☀️ 取消静音：关闭静音\n\n"
@@ -821,7 +839,7 @@ def render_records():
     }
 
     lines = ["📢 播报记录", ""]
-    for row in rows:
+    for sequence, row in enumerate(rows, 1):
         status = status_label.get(row["status"], row["status"])
         if row["status"] == "sent":
             mark = "已播放" if row["acked_at_utc"] else "已发送，待确认"
@@ -829,7 +847,9 @@ def render_records():
             mark = f"{status} · {row['last_error'][:20]}"
         else:
             mark = status
-        lines.append(f"#{row['id']} · {_kind_label(row['kind'])} · {mark}")
+        lines.append(
+            f"{sequence}. {_kind_label(row['kind'])} · {mark}"
+        )
 
     lines.extend(["", "0 返回"])
     return "\n".join(lines)
@@ -1401,7 +1421,7 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
 
     if result == "duplicate":
         return_message = (
-            f"ℹ️ 这条待办已经存在 #{todo_id}\n\n"
+            "ℹ️ 这条待办已经存在\n\n"
             f"{title} · {format_due_friendly(due_utc)}"
         )
         return return_message + "\n\n" + _enter(
@@ -1412,7 +1432,7 @@ def _add_todo(conn, chat_id, date_text, time_text, title):
         return "😅 待办没保存成功，稍后再试\n\n直接按格式重发 · 0 返回"
 
     return_message = (
-        f"✅ 记下了 #{todo_id}\n\n"
+        "✅ 已记下\n\n"
         f"{title} · {format_due_friendly(due_utc)}\n"
         "到点我会提醒你"
     )
@@ -1545,14 +1565,31 @@ def handle_command(conn, text, chat_id, event_id=None):
     if todo_action is not None:
         return todo_action
 
+    match = re.match(r"^(确认|取消)候选\s*(\d+)\s*$", text)
+    if match:
+        action, index_text = match.groups()
+        display_index = int(index_text)
+        candidates = echomate_store.list_memory_candidates(
+            OWNER_OPEN_ID, 10, conn=conn
+        )
+        if 1 <= display_index <= len(candidates):
+            candidate_id = candidates[display_index - 1]["id"]
+            decision = "accept" if action == "确认" else "reject"
+            if echomate_store.decide_memory_candidate(
+                OWNER_OPEN_ID, candidate_id, decision, conn=conn
+            ):
+                result = "写入" if action == "确认" else "取消"
+                return f"✅ 候选记忆已{result}"
+        return "没有找到这条候选记忆\n\n回复：记忆候选"
+
     match = re.match(r"^确认记忆\s*#?(\d+)\s*$", text)
     if match:
         candidate_id = int(match.group(1))
         if echomate_store.decide_memory_candidate(
             OWNER_OPEN_ID, candidate_id, "accept", conn=conn
         ):
-            return f"✅ 记忆 #{candidate_id} 已确认写入"
-        return f"😅 没有待确认的候选记忆 #{candidate_id}"
+            return "✅ 记忆已确认写入"
+        return "没有找到这条候选记忆"
 
     match = re.match(r"^取消记忆\s*#?(\d+)\s*$", text)
     if match:
@@ -1560,8 +1597,8 @@ def handle_command(conn, text, chat_id, event_id=None):
         if echomate_store.decide_memory_candidate(
             OWNER_OPEN_ID, candidate_id, "reject", conn=conn
         ):
-            return f"✅ 已取消候选记忆 #{candidate_id}"
-        return f"😅 没有待确认的候选记忆 #{candidate_id}"
+            return "✅ 已取消候选记忆"
+        return "没有找到这条候选记忆"
 
     if text in {"记忆候选", "待确认记忆"}:
         candidates = echomate_store.list_memory_candidates(
@@ -1570,9 +1607,13 @@ def handle_command(conn, text, chat_id, event_id=None):
         if not candidates:
             return "📚 没有待确认的候选记忆"
         lines = [f"📝 待确认候选 {len(candidates)} 条", ""]
-        for item in candidates:
-            lines.append(f"#{item['id']} · {item['content'][:60]}")
-        lines.extend(["", "确认发：确认记忆 #编号", "取消发：取消记忆 #编号"])
+        for sequence, item in enumerate(candidates, 1):
+            lines.append(f"{sequence}. {item['content'][:60]}")
+        lines.extend([
+            "",
+            "确认：确认候选 1",
+            "取消：取消候选 1",
+        ])
         return "\n".join(lines)
 
     # -------- 全局导航 --------
@@ -1732,18 +1773,15 @@ def handle_command(conn, text, chat_id, event_id=None):
         )
 
         if not cursor.rowcount:
-            return (
-                f"😅 没有 #{todo_id} 这个待办\n\n"
-                "发送：待办"
-            )
+            return "没有找到这条待办\n\n发送：待办"
 
         if action == "取消待办":
             return (
-                f"🧹 #{todo_id} 已移出待办\n\n"
+                "🧹 待办已取消\n\n"
                 + _enter(conn, chat_id, "todo", mode="replace")
             )
 
-        return f"✅ #{todo_id} 完成\n\n" + _enter(
+        return "✅ 待办已完成\n\n" + _enter(
             conn, chat_id, "todo", mode="replace"
         )
 
@@ -1768,14 +1806,17 @@ def handle_command(conn, text, chat_id, event_id=None):
             OWNER_OPEN_ID, content, source="feishu", conn=conn
         )
         if result == "created":
+            display_index = _memory_candidate_display_index(
+                conn, candidate_id
+            )
             return (
-                f"📝 已生成记忆候选 #{candidate_id}\n\n"
+                "📝 已生成记忆候选\n\n"
                 f"{content[:150]}\n\n"
-                f"确认发：确认记忆 #{candidate_id}\n"
-                f"取消发：取消记忆 #{candidate_id}"
+                f"确认：确认候选 {display_index}\n"
+                f"取消：取消候选 {display_index}"
             )
         if result == "duplicate":
-            return f"ℹ️ 已有相同候选记忆 #{candidate_id}"
+            return "ℹ️ 已有相同候选记忆\n\n回复：记忆候选"
         if result == "too_long":
             return "😅 太长了，2000 字以内"
         return "😅 要记的内容是空的"
@@ -1809,12 +1850,38 @@ def handle_command(conn, text, chat_id, event_id=None):
             )
 
         lines = [f"🔎 找到 {len(rows)} 条", ""]
-        for memory_id, content in rows:
-            lines.append(f"#{memory_id} · {content[:120]}")
+        for sequence, (_, content) in enumerate(rows, 1):
+            lines.append(f"{sequence}. {content[:120]}")
         lines.extend(["", "4 看记忆 · 0 返回"])
         return "\n".join(lines)
 
     # -------- 删除记忆 --------
+
+    match = re.match(r"^删除第\s*(\d+)\s*条(?:记忆)?$", text)
+    if match:
+        display_index = int(match.group(1))
+        row = conn.execute(
+            """
+            SELECT id, content
+            FROM memories
+            WHERE owner_id = ?
+            ORDER BY id DESC
+            LIMIT 1 OFFSET ?
+            """,
+            (OWNER_OPEN_ID, max(0, display_index - 1)),
+        ).fetchone()
+        if row is None:
+            return "没有找到这条记忆\n\n4 看记忆 · 0 返回"
+        memory_id, content = row[0], row[1]
+        if not echomate_store.delete_memory(
+            OWNER_OPEN_ID, memory_id, conn=conn
+        ):
+            return "没有找到这条记忆\n\n4 看记忆 · 0 返回"
+        return (
+            "✅ 已删除这条记忆\n\n"
+            f"{content[:40]}\n\n"
+            "4 看记忆 · 0 返回"
+        )
 
     match = re.match(r"^删除记忆\s*[:：#]?\s*(\d+)\s*$", text)
 
@@ -1826,15 +1893,15 @@ def handle_command(conn, text, chat_id, event_id=None):
         ).fetchone()
 
         if not row:
-            return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
+            return "没有找到这条记忆\n\n4 看记忆 · 0 返回"
 
         if not echomate_store.delete_memory(
             OWNER_OPEN_ID, memory_id, conn=conn
         ):
-            return f"😅 没有 #{memory_id}\n\n4 看记忆 · 0 返回"
+            return "没有找到这条记忆\n\n4 看记忆 · 0 返回"
         preview = row[0][:40]
         return (
-            f"✅ 删掉了 #{memory_id}\n\n"
+            "✅ 已删除这条记忆\n\n"
             f"{preview}\n\n"
             "4 看记忆 · 0 返回"
         )
@@ -3096,8 +3163,8 @@ def reminder_loop():
                     due_display = format_due_friendly(delivery["due_at_utc"])
                     content = (
                         f"⏰ {title}\n\n"
-                        f"{due_display} · #{todo_id}\n"
-                        f"完成 → 完成待办 {todo_id}"
+                        f"{due_display}\n\n"
+                        "完成后打开待办清单操作"
                     )
                     try:
                         sent = send_text(chat_id, content)
@@ -3217,9 +3284,13 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
                 OWNER_OPEN_ID, match.group(1).strip()
             )
             if result == "created":
-                reply = f"📝 已生成记忆候选 #{candidate_id}\n确认请发：确认记忆 #{candidate_id}\n取消请发：取消记忆 #{candidate_id}"
+                reply = (
+                    "📝 已生成记忆候选\n"
+                    "回复：记忆候选\n"
+                    "查看并确认"
+                )
             elif result == "duplicate":
-                reply = f"已有相同候选记忆 #{candidate_id}\n确认请发：确认记忆 #{candidate_id}"
+                reply = "已有相同候选记忆\n回复：记忆候选"
             elif result == "too_long":
                 reply = "😅 太长了，2000 字以内"
             else:

@@ -1,4 +1,5 @@
 import unittest
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,13 +30,14 @@ class MenuUITest(unittest.TestCase):
             status = bot.render_status()
             detail = bot.render_status_detail()
 
-        self.assertIn("核心服务 5/5 正常", status)
-        self.assertIn("SSH 通知 🟢", status)
-        self.assertIn("Flow 查看 🟢", status)
-        self.assertIn("数据库备份 🟢", status)
-        self.assertIn("echomate-ssh-session-watch", detail)
-        self.assertIn("echomate-flowview", detail)
-        self.assertIn("echomate-db-backup", detail)
+        self.assertIn("核心服务 5/5", status)
+        self.assertIn("语音服务  正常", status)
+        self.assertIn("SSH 通知  正常", status)
+        self.assertIn("Flow 查看  正常", status)
+        self.assertIn("定时任务", status)
+        self.assertIn("数据库备份  正常", status)
+        self.assertNotIn("echomate-", detail)
+        self.assertNotIn("active", detail)
 
     def test_cards_have_title_body_and_footer(self):
         card = bot.build_page_card("menu", bot.menu_text())
@@ -111,6 +113,57 @@ class MenuUITest(unittest.TestCase):
         self.assertIn("待办提醒　已开启", notify)
         self.assertIn("已发送，待确认", records)
         self.assertIn("已播放", records)
+        self.assertNotIn("#", records)
+
+    def test_memory_page_hides_internal_ids(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    content TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO memories (owner_id, content) VALUES (?, ?)",
+                (bot.OWNER_OPEN_ID, "喜欢简短回答"),
+            )
+            memory = bot.render_memory(conn)
+        finally:
+            conn.close()
+
+        self.assertIn("1. 喜欢简短回答", memory)
+        self.assertIn("删除第 1 条", memory)
+        self.assertNotIn("#", memory)
+
+    def test_memory_candidates_use_display_numbers(self):
+        candidates = [{"id": 42, "content": "喜欢简短回答"}]
+        conn = sqlite3.connect(":memory:")
+        try:
+            with patch(
+                "bot.echomate_store.list_memory_candidates",
+                return_value=candidates,
+            ):
+                listing = bot.handle_command(conn, "记忆候选", "chat")
+
+            with patch(
+                "bot.echomate_store.list_memory_candidates",
+                return_value=candidates,
+            ), patch(
+                "bot.echomate_store.decide_memory_candidate",
+                return_value=True,
+            ):
+                accepted = bot.handle_command(conn, "确认候选 1", "chat")
+        finally:
+            conn.close()
+
+        self.assertIn("1. 喜欢简短回答", listing)
+        self.assertIn("确认候选 1", listing)
+        self.assertNotIn("#", listing)
+        self.assertIn("候选记忆已写入", accepted)
 
 
 if __name__ == "__main__":

@@ -6,11 +6,12 @@ Only standard library dependencies are used.
 
 import hashlib
 import re
-import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from sqlite_db import connect as sqlite_connect
+from sqlite_db import retry_locked
 
 DB_PATH = Path("/var/lib/echomate/assistant.db")
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -21,23 +22,18 @@ def now_utc():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-@contextmanager
 def connect():
-    conn = sqlite3.connect(str(DB_PATH), timeout=15)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return sqlite_connect(DB_PATH)
+
+
+def write_connect():
+    return sqlite_connect(DB_PATH, write=True)
 
 
 def init_schema():
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+    with write_connect() as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS memories (
@@ -171,7 +167,7 @@ def enqueue_memory_candidate(owner_id, content, source="ai_chat", category=None,
     category = category or detect_category(content)
     if conn is not None:
         return _enqueue_memory_candidate(conn, owner_id, content, source, category)
-    with connect() as owned_conn:
+    with write_connect() as owned_conn:
         return _enqueue_memory_candidate(
             owned_conn, owner_id, content, source, category
         )
@@ -225,7 +221,7 @@ def decide_memory_candidate(owner_id, candidate_id, decision, conn=None):
         return False
     if conn is not None:
         return _decide_memory_candidate(conn, owner_id, candidate_id, decision)
-    with connect() as owned_conn:
+    with write_connect() as owned_conn:
         return _decide_memory_candidate(
             owned_conn, owner_id, candidate_id, decision
         )
@@ -263,7 +259,7 @@ def _decide_memory_candidate(conn, owner_id, candidate_id, decision):
 def delete_memory(owner_id, memory_id, conn=None):
     if conn is not None:
         return _delete_memory(conn, owner_id, memory_id)
-    with connect() as owned_conn:
+    with write_connect() as owned_conn:
         return _delete_memory(owned_conn, owner_id, memory_id)
 
 
@@ -278,7 +274,7 @@ def _delete_memory(conn, owner_id, memory_id):
 def clear_memories(owner_id, conn=None):
     if conn is not None:
         return _clear_memories(conn, owner_id)
-    with connect() as owned_conn:
+    with write_connect() as owned_conn:
         return _clear_memories(owned_conn, owner_id)
 
 
@@ -325,7 +321,7 @@ def create_todo(owner_id, title, due_at_utc, source="feishu",
             conn, owner_id, title, due_text, source, chat_id, dedupe_key,
             notify_deskbot, notify_feishu
         )
-    with connect() as owned_conn:
+    with write_connect() as owned_conn:
         return _create_todo(
             owned_conn, owner_id, title, due_text, source, chat_id, dedupe_key,
             notify_deskbot, notify_feishu
@@ -388,7 +384,7 @@ def set_todo_status(owner_id, todo_id, status, conn=None):
         return False
     if conn is not None:
         return _set_todo_status(conn, owner_id, todo_id, status)
-    with connect() as owned_conn:
+    with write_connect() as owned_conn:
         return _set_todo_status(owned_conn, owner_id, todo_id, status)
 
 
@@ -403,13 +399,14 @@ def _set_todo_status(conn, owner_id, todo_id, status):
 REMINDER_GRACE_MINUTES = 5
 
 
+@retry_locked
 def materialize_due_reminders(grace_minutes=REMINDER_GRACE_MINUTES):
     """Create deliveries only for reminders that are still timely."""
     now = now_utc()
     grace_cutoff = (
         datetime.now(timezone.utc) - timedelta(minutes=grace_minutes)
     ).isoformat(timespec="seconds")
-    with connect() as conn:
+    with write_connect() as conn:
         conn.execute(
             """
             UPDATE reminder_deliveries
@@ -418,9 +415,7 @@ def materialize_due_reminders(grace_minutes=REMINDER_GRACE_MINUTES):
             WHERE status IN ('pending', 'claimed')
               AND todo_id IN (
                   SELECT id FROM todos
-                  WHERE status = 'pending'
-                    AND reminded_at_utc IS NULL
-                    AND due_at_utc < ?
+                  WHERE due_at_utc < ?
               )
             """,
             (grace_cutoff,),
@@ -487,12 +482,13 @@ def pending_deskbot_deliveries():
     return [dict(row) for row in rows]
 
 
+@retry_locked
 def claim_delivery(channel):
     grace_cutoff = (
         datetime.now(timezone.utc)
         - timedelta(minutes=REMINDER_GRACE_MINUTES)
     ).isoformat(timespec="seconds")
-    with connect() as conn:
+    with write_connect() as conn:
         row = conn.execute(
             """
             SELECT d.id AS delivery_id, d.todo_id, d.attempts,
@@ -522,10 +518,11 @@ def claim_delivery(channel):
         return dict(row)
 
 
+@retry_locked
 def mark_delivery(delivery_id, status, error=None):
     if status not in ("sent", "failed", "skipped"):
         return
-    with connect() as conn:
+    with write_connect() as conn:
         conn.execute(
             """
             UPDATE reminder_deliveries
@@ -551,41 +548,61 @@ def mark_delivery(delivery_id, status, error=None):
                 )
 
 
-def acknowledge_delivery(delivery_id):
-    """Mark the client ACK and finalize the todo when all channels finish."""
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT todo_id FROM reminder_deliveries WHERE id = ?",
-            (int(delivery_id),),
-        ).fetchone()
-        if not row:
-            return False
-        conn.execute(
-            """
-            UPDATE reminder_deliveries
-            SET status = 'sent', acked_at_utc = ?
-            WHERE id = ? AND acked_at_utc IS NULL
-            """,
-            (now_utc(), int(delivery_id)),
-        )
-        todo_id = row["todo_id"]
-
-    finalize_todo_if_delivered(todo_id)
+def _acknowledge_delivery(conn, delivery_id):
+    row = conn.execute(
+        "SELECT todo_id FROM reminder_deliveries WHERE id = ?",
+        (int(delivery_id),),
+    ).fetchone()
+    if not row:
+        return False
+    conn.execute(
+        """
+        UPDATE reminder_deliveries
+        SET status = 'sent', acked_at_utc = ?
+        WHERE id = ? AND acked_at_utc IS NULL
+        """,
+        (now_utc(), int(delivery_id)),
+    )
+    _finalize_todo_if_delivered(conn, row["todo_id"])
     return True
 
 
-def finalize_todo_if_delivered(todo_id):
-    with connect() as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM reminder_deliveries
-            WHERE todo_id = ? AND status IN ('pending', 'claimed', 'failed')
-            """,
-            (int(todo_id),),
-        ).fetchone()
-        if row and row["n"] == 0:
-            conn.execute(
-                "UPDATE todos SET reminded_at_utc = ? "
-                "WHERE id = ? AND reminded_at_utc IS NULL",
-                (now_utc(), int(todo_id)),
-            )
+@retry_locked
+def _acknowledge_delivery_transaction(delivery_id):
+    with write_connect() as conn:
+        return _acknowledge_delivery(conn, delivery_id)
+
+
+def acknowledge_delivery(delivery_id, conn=None):
+    """Mark the client ACK and finalize the todo when all channels finish."""
+    if conn is not None:
+        return _acknowledge_delivery(conn, delivery_id)
+    return _acknowledge_delivery_transaction(delivery_id)
+
+
+def _finalize_todo_if_delivered(conn, todo_id):
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM reminder_deliveries
+        WHERE todo_id = ? AND status IN ('pending', 'claimed', 'failed')
+        """,
+        (int(todo_id),),
+    ).fetchone()
+    if row and row["n"] == 0:
+        conn.execute(
+            "UPDATE todos SET reminded_at_utc = ? "
+            "WHERE id = ? AND reminded_at_utc IS NULL",
+            (now_utc(), int(todo_id)),
+        )
+
+
+@retry_locked
+def _finalize_todo_if_delivered_transaction(todo_id):
+    with write_connect() as conn:
+        _finalize_todo_if_delivered(conn, todo_id)
+
+
+def finalize_todo_if_delivered(todo_id, conn=None):
+    if conn is not None:
+        return _finalize_todo_if_delivered(conn, todo_id)
+    return _finalize_todo_if_delivered_transaction(todo_id)

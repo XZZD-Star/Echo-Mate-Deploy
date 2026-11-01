@@ -1,6 +1,4 @@
 import argparse
-import sqlite3
-from contextlib import contextmanager
 import subprocess
 import time
 from datetime import datetime, timezone, timedelta
@@ -13,6 +11,7 @@ import os
 import json
 import sys
 from echomate_credentials import credential
+from sqlite_db import connect as sqlite_connect
 
 # 主动播报队列：与 AIChat Server 共用同一份 SQLite。
 sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
@@ -115,24 +114,14 @@ def parse_time(value):
     return datetime.fromisoformat(value)
 
 
-@contextmanager
 def db_connect():
-    """连接用完必须关闭，否则 WAL 下会累积句柄并长期持有写锁。"""
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return sqlite_connect(DB_PATH, write=True)
 
 
 def init_db():
-    with db_connect() as conn:
+    with sqlite_connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+    with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS monitor_state (
                 alert_key TEXT PRIMARY KEY,

@@ -4,7 +4,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-from contextlib import contextmanager
 import psutil
 import requests
 import threading
@@ -26,6 +25,13 @@ from tools import memory_store
 import echomate_store
 from services import assistant_actions
 from contextvars import ContextVar
+from sqlite_db import connect as sqlite_connect
+from sqlite_db import open_connection
+import agent_runtime
+import pc_control_service
+import pc_control_store
+import pc_pages
+from pc_routing import PC_PAGES
 
 CURRENT_CHAT_ID = ContextVar("CURRENT_CHAT_ID", default="")
 
@@ -43,6 +49,8 @@ OWNER_OPEN_ID = credential("lark_owner_open_id")
 
 DB_PATH = Path("/var/lib/echomate/assistant.db")
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+PC_DEVICE_ID = os.environ.get("ECHOMATE_PC_DEVICE_ID", "windows-main")
+PC_PROFILE_ID = os.environ.get("ECHOMATE_PC_PROFILE_ID", "default")
 
 if not APP_ID or not APP_SECRET:
     raise SystemExit("错误：App ID 或 App Secret 未配置")
@@ -52,21 +60,6 @@ if not OWNER_OPEN_ID.startswith("ou_"):
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 os.chmod(DB_PATH.parent, 0o700)
-
-
-@contextmanager
-def db_conn():
-    """连接用完必须关闭，否则 WAL 下会累积句柄并持有写锁。"""
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 def now_utc():
@@ -98,7 +91,7 @@ def format_due_friendly(utc_text):
 # ==================== 数据库 ====================
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
@@ -154,7 +147,7 @@ def init_db():
 
 def init_chat_table():
     """建立独立聊天历史表，不修改已有记忆和待办数据。"""
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS chat_messages (
@@ -184,6 +177,8 @@ PAGES = {
     "todo_history",
     "memory", "help", "notify", "quiet", "records",
     "memory_clear_confirm",
+    "pc", "pc_single", "pc_fixed", "pc_fixed_new",
+    "pc_history", "pc_history_detail",
 }
 
 # 0 返回上一级；未列出的页面回到主菜单。
@@ -194,6 +189,11 @@ PAGE_PARENT = {
     "quiet": "notify",
     "records": "notify",
     "memory_clear_confirm": "memory",
+    "pc_single": "pc",
+    "pc_fixed": "pc",
+    "pc_fixed_new": "pc_fixed",
+    "pc_history": "pc",
+    "pc_history_detail": "pc_history",
 }
 
 
@@ -220,29 +220,75 @@ def state_nav_stack(state):
 
 
 PAGE_UNKNOWN_HINT = {
-    "status": "😅 状态页只有 1 刷新、2 详情、0 返回",
-    "status_detail": "😅 状态详情页只有 1 刷新、0 返回",
+    "status": "这里没有这个编号\n1 刷新 · 2 详情 · 0 返回",
+    "status_detail": "这里没有这个编号\n1 刷新 · 0 返回",
     "todo": (
-        "😅 待办页没有这个数字操作\n"
+        "这里没有这个数字操作\n"
         "完成：完成 今天待办1\n"
         "取消：取消 明天待办1\n"
         "0 返回"
     ),
-    "todo_new": "😅 新建待办页只接收结构化待办\n0 返回",
-    "todo_history": "😅 历史待办页没有这个数字操作\n0 返回",
-    "memory": "😅 记忆页只有 1 展开全部、0 返回",
-    "help": "😅 帮助页只有 0 返回",
-    "notify": "😅 播报设置页只有 1 到 4 的操作、0 返回",
-    "quiet": "😅 静音页没有数字操作\n0 返回",
-    "records": "😅 播报记录页没有数字操作\n0 返回",
-    "memory_clear_confirm": "😅 请发送“确认清空记忆”或 0 返回",
+    "todo_new": "这里需要直接填写待办内容\n0 返回",
+    "todo_history": "这里没有这个数字操作\n0 返回",
+    "memory": "这里没有这个编号\n1 查看全部 · 0 返回",
+    "help": "帮助页可直接回复 0 返回",
+    "notify": "这里没有这个编号\n请选择 1 到 4，或回复 0 返回",
+    "quiet": "静音页请直接发送设置命令\n0 返回",
+    "records": "播报记录页没有数字操作\n0 返回",
+    "memory_clear_confirm": "请发送“确认清空记忆”或 0 返回",
+    "pc": "这里没有这个编号\n请选择 1 到 3，或回复 0 返回",
+    "pc_single": "请直接发送一条任务\n0 取消",
+    "pc_fixed": "请直接发送任务，或选择页面上的编号\n0 返回",
+    "pc_fixed_new": "请直接发送第一条任务\n0 取消",
+    "pc_history": "请发送任务编号查看详情\n0 返回",
+    "pc_history_detail": "任务详情页可直接回复 0 返回",
+}
+
+PAGE_CARD_CONFIG = {
+    "menu": ("Echo-Mate", "blue"),
+    "status": ("运行状态", "green"),
+    "status_detail": ("系统详情", "turquoise"),
+    "todo": ("待办清单", "orange"),
+    "todo_new": ("新建待办", "orange"),
+    "todo_history": ("历史待办", "grey"),
+    "memory": ("长期记忆", "purple"),
+    "help": ("使用帮助", "blue"),
+    "notify": ("语音播报", "turquoise"),
+    "quiet": ("静音设置", "grey"),
+    "records": ("播报记录", "turquoise"),
+    "memory_clear_confirm": ("清空记忆", "red"),
+    "pc": ("本机 Codex", "purple"),
+    "pc_single": ("本机 Codex", "purple"),
+    "pc_fixed": ("本机 Codex", "purple"),
+    "pc_fixed_new": ("本机 Codex", "purple"),
+    "pc_history": ("本机 Codex", "purple"),
+    "pc_history_detail": ("本机 Codex", "purple"),
+}
+
+PAGE_CARD_DROP_FIRST = {
+    "🐣 Echo-Mate",
+    "🔍 状态详情",
+    "➕ 新建待办",
+    "📜 历史待办",
+    "💡 帮助",
+    "🔊 播报设置",
+    "🌙 静音设置",
+    "📢 播报记录",
+    "⚠️ 清空全部记忆？",
 }
 
 SERVICE_UNITS = [
-    ("echomate-server.service", "语音", "echomate-server"),
-    ("echomate-feishu-bot.service", "飞书", "echomate-feishu-bot"),
-    ("echomate-monitor.service", "监控", "echomate-monitor"),
+    ("echomate-server.service", "语音服务", "echomate-server"),
+    ("echomate-feishu-bot.service", "飞书机器人", "echomate-feishu-bot"),
+    ("echomate-monitor.service", "资源监控", "echomate-monitor"),
+    (
+        "echomate-ssh-session-watch.service",
+        "SSH 通知",
+        "echomate-ssh-session-watch",
+    ),
+    ("echomate-flowview.service", "Flow 查看", "echomate-flowview"),
 ]
+BACKUP_UNIT = ("echomate-db-backup.timer", "数据库备份", "echomate-db-backup")
 
 PAGE_TTL_SECONDS = 86400
 
@@ -305,6 +351,10 @@ def get_page_state(chat_id, conn=None):
     if (
         datetime.now(timezone.utc) - stamp
     ).total_seconds() > PAGE_TTL_SECONDS:
+        if page == "pc_fixed":
+            pc_control_store.pause_active_session(
+                OWNER_OPEN_ID, chat_id, conn=conn
+            )
         return {"page": "menu"}
 
     data["page"] = page
@@ -328,23 +378,37 @@ def set_page(chat_id, page, state=None, conn=None):
     )
 
 
+def _pc_control_enabled(conn=None):
+    return _read_setting(conn, "pc_control_enabled", "1") != "0"
+
+
+def _pause_pc_session_for_navigation(conn, chat_id, old_page, new_page):
+    if old_page == "pc_fixed" and new_page != "pc_fixed":
+        pc_control_store.pause_active_session(
+            OWNER_OPEN_ID, chat_id, conn=conn
+        )
+
+
+def _unit_state(unit):
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", unit],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        return (proc.stdout or "").strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
 def _service_states():
     """返回 [(中文标签, systemd 状态, unit 简名), ...]。"""
-    result = []
-    for unit, label, short in SERVICE_UNITS:
-        try:
-            proc = subprocess.run(
-                ["systemctl", "is-active", unit],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            state = (proc.stdout or "").strip() or "unknown"
-        except (OSError, subprocess.TimeoutExpired):
-            state = "unknown"
-        result.append((label, state, short))
-    return result
+    return [
+        (label, _unit_state(unit), short)
+        for unit, label, short in SERVICE_UNITS
+    ]
 
 
 def _uptime_text():
@@ -367,14 +431,16 @@ def _boot_text():
 
 def menu_text():
     return (
-        "🐣 Echo\n\n"
-        "1 · 📊 状态\n"
-        "2 · 📋 待办\n"
-        "3 · ➕ 新待办\n"
-        "4 · 📚 记忆\n"
-        "5 · 💡 帮助\n"
-        "6 · 🔊 播报\n\n"
-        "直接发数字就行"
+        "🐣 Echo-Mate\n"
+        "你的桌面助手\n\n"
+        "1 · 📊 运行状态\n"
+        "2 · 📋 待办清单\n"
+        "3 · ➕ 新建待办\n"
+        "4 · 📚 长期记忆\n"
+        "5 · 💡 使用帮助\n"
+        "6 · 🔊 语音播报\n"
+        "7 · 🖥 本机 Codex\n\n"
+        "回复数字进入，0 返回上一级"
     )
 
 
@@ -384,31 +450,41 @@ def render_status():
     disk = psutil.disk_usage("/")
     states = _service_states()
     down = [label for label, state, _ in states if state != "active"]
+    backup_state = _unit_state(BACKUP_UNIT[0])
+    active_count = sum(state == "active" for _, state, _ in states)
 
     if down:
-        head = "🟡 有服务掉线"
+        head = "⚠️ 有服务未运行"
     elif cpu > 90 or mem.available < 250 * 1024**2:
-        head = "🟡 有点忙"
+        head = "⚠️ 当前负载较高"
+    elif backup_state != "active":
+        head = "⚠️ 备份计划未运行"
     else:
-        head = "📊 一切正常"
-
-    service_line = " · ".join(
-        f"{label} {'🟢' if state == 'active' else '🔴'}"
-        for label, state, _ in states
-    )
+        head = "✅ 运行正常"
 
     lines = [
         head,
         "",
-        f"CPU {cpu:.0f}% · 内存 {mem.available / 1024**2:.0f}M"
-        f" · 磁盘 {disk.free / 1024**3:.0f}G",
-        f"已跑 {_uptime_text()} · 开机 {_boot_text()}",
+        f"核心服务 {active_count}/{len(states)} 正常",
+        f"CPU {cpu:.0f}% · 可用内存 {mem.available / 1024**2:.0f}M"
+        f" · 剩余磁盘 {disk.free / 1024**3:.0f}G",
+        f"运行 {_uptime_text()} · 开机 {_boot_text()}",
         "",
-        service_line,
+        " · ".join(
+            f"{label} {'🟢' if state == 'active' else '🔴'}"
+            for label, state, _ in states[:3]
+        ),
+        " · ".join(
+            f"{label} {'🟢' if state == 'active' else '🔴'}"
+            for label, state, _ in states[3:]
+        ),
+        f"{BACKUP_UNIT[1]} {'🟢' if backup_state == 'active' else '🔴'}",
     ]
 
     if down:
-        lines.append("掉线：" + "、".join(down))
+        lines.append("未运行：" + "、".join(down))
+    if backup_state != "active":
+        lines.append(f"未运行：{BACKUP_UNIT[1]}")
 
     lines.append("")
     lines.append("1 刷新 · 2 详情 · 0 返回")
@@ -424,6 +500,7 @@ def render_status_detail():
         psutil.boot_time(), tz=timezone.utc
     ).astimezone(LOCAL_TZ)
     states = _service_states()
+    backup_state = _unit_state(BACKUP_UNIT[0])
 
     lines = [
         "🔍 状态详情",
@@ -442,6 +519,11 @@ def render_status_detail():
     for label, state, short in states:
         icon = "🟢" if state == "active" else "🔴"
         lines.append(f"{label} {icon} {state} · {short}")
+
+    backup_icon = "🟢" if backup_state == "active" else "🔴"
+    lines.append(
+        f"{BACKUP_UNIT[1]} {backup_icon} {backup_state} · {BACKUP_UNIT[2]}"
+    )
 
     lines.extend(["", "1 刷新 · 0 返回"])
     return "\n".join(lines)
@@ -644,6 +726,8 @@ def render_memory(conn, show_all=False):
 def render_help():
     return (
         "💡 帮助\n\n"
+        "📊 运行状态\n"
+        "查看服务：状态\n\n"
         "📋 待办\n"
         "➕ 新建待办：添加待办 2026-10-29 09:00 交作业\n"
         "📄 查看待办：待办\n"
@@ -656,6 +740,10 @@ def render_help():
         "🔊 播报\n"
         "🌙 设置静音：静音 23:00 08:00\n"
         "☀️ 取消静音：关闭静音\n\n"
+        "🖥 本机 Codex\n"
+        "打开页面：本机 Codex\n\n"
+        "菜单\n"
+        "随时回复“菜单”返回主菜单。\n\n"
         "0 返回"
     )
 
@@ -680,11 +768,11 @@ def render_notify():
         "🔊 播报设置",
         "",
         f"🌙 静音时段　{quiet_text}",
-        f"📋 待办播报　{'开启 ●' if todo_on else '未开启'}",
-        f"📡 监控播报　{'开启 ●' if monitor_on else '未开启'}",
-        f"📤 待播通知　{pending} 条",
+        f"📋 待办提醒　{'已开启' if todo_on else '已关闭'}",
+        f"📡 监控提醒　{'已开启' if monitor_on else '已关闭'}",
+        f"📤 待播消息　{pending} 条",
         "",
-        "⚙️ 操作",
+        "操作",
         "1 静音设置",
         f"2 {'关闭' if todo_on else '开启'}待办播报",
         f"3 {'关闭' if monitor_on else '开启'}监控播报",
@@ -725,18 +813,18 @@ def render_records():
         return "📢 播报记录\n\n还没有记录\n\n0 返回"
 
     status_label = {
-        "pending": "待播",
-        "claimed": "播放中",
-        "sent": "已播",
-        "failed": "失败",
-        "expired": "过期",
+        "pending": "等待播报",
+        "claimed": "正在播报",
+        "sent": "已发送",
+        "failed": "播报失败",
+        "expired": "已过期",
     }
 
     lines = ["📢 播报记录", ""]
     for row in rows:
         status = status_label.get(row["status"], row["status"])
         if row["status"] == "sent":
-            mark = f"{status} {'✓' if row['acked_at_utc'] else '·'}"
+            mark = "已播放" if row["acked_at_utc"] else "已发送，待确认"
         elif row["last_error"]:
             mark = f"{status} · {row['last_error'][:20]}"
         else:
@@ -745,6 +833,73 @@ def render_records():
 
     lines.extend(["", "0 返回"])
     return "\n".join(lines)
+
+
+def build_page_card(page, text):
+    title, template = PAGE_CARD_CONFIG.get(page, ("Echo-Mate", "blue"))
+    lines = str(text or "").strip().splitlines()
+
+    if lines and lines[0].strip() in PAGE_CARD_DROP_FIRST:
+        lines = lines[1:]
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+
+    footer = "回复编号继续 · 0 返回"
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index].strip()
+        if line and ("0 返回" in line or "0 取消" in line):
+            footer = line
+            del lines[index]
+            break
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    body = "\n".join(lines).strip()
+    if page == "menu":
+        body = re.sub(
+            r"^(\d+) · (.*)$",
+            r"**\1** · \2",
+            body,
+            flags=re.MULTILINE,
+        )
+    elif page == "status":
+        status_lines = body.splitlines()
+        if status_lines:
+            status_lines[0] = f"**{status_lines[0]}**"
+        for index, line in enumerate(status_lines):
+            if line.startswith("核心服务 "):
+                status_lines[index] = f"**{line}**"
+        body = "\n".join(status_lines)
+    if page in {"status", "status_detail"}:
+        if "🔴" in body or "⚠️" in body:
+            template = "orange"
+        elif "🟢" in body or "✅" in body:
+            template = "green"
+
+    elements = []
+    if body:
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": body},
+        })
+    elements.extend([
+        {"tag": "hr"},
+        {
+            "tag": "note",
+            "elements": [{
+                "tag": "plain_text",
+                "content": footer,
+            }],
+        },
+    ])
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": elements,
+    }
 
 
 def render_page(conn, chat_id, page):
@@ -804,10 +959,68 @@ def _kind_label(kind):
     }.get(kind, kind)
 
 
+def _build_pc_page(conn, chat_id, page):
+    if not _pc_control_enabled(conn):
+        return "🖥 本机 Codex 暂时关闭\n\n0 返回", {}
+
+    online, health = pc_control_service.health_snapshot()
+
+    if page == "pc":
+        return pc_pages.render_pc_home(online, health), {}
+    if page == "pc_single":
+        return pc_pages.render_pc_single(online, health), {}
+    if page == "pc_fixed_new":
+        return pc_pages.render_pc_fixed_new(online, health), {}
+    if page == "pc_fixed":
+        active = pc_control_store.get_active_session(
+            OWNER_OPEN_ID, chat_id, conn=conn
+        )
+        recoverable = pc_control_store.list_recoverable_sessions(
+            OWNER_OPEN_ID, chat_id, conn=conn
+        )
+        active_job = pc_control_store.get_active_job_for_device(
+            PC_DEVICE_ID, conn=conn
+        )
+        turn_count = (
+            pc_control_store.count_session_turns(
+                active["id"], conn=conn
+            )
+            if active is not None
+            else 0
+        )
+        return pc_pages.render_pc_fixed(
+            active,
+            recoverable,
+            active_job,
+            online,
+            health,
+            turn_count,
+        ), {}
+    if page == "pc_history":
+        rows = pc_control_store.list_history(
+            OWNER_OPEN_ID, chat_id, limit=10, conn=conn
+        )
+        return pc_pages.render_pc_history(rows), {
+            "history_job_ids": [row["id"] for row in rows]
+        }
+    if page == "pc_history_detail":
+        state = get_page_state(chat_id, conn=conn)
+        job = pc_control_store.get_history_job(
+            state.get("history_job_id", 0),
+            OWNER_OPEN_ID,
+            chat_id,
+            conn=conn,
+        )
+        return pc_pages.render_pc_history_detail(job), {}
+    return "🖥 本机 Codex\n\n0 返回", {}
+
+
 def _render_page_state(conn, chat_id, page):
     state = None
     if page == "todo":
         reply, state = _build_todo_page(conn)
+    elif page in PC_PAGES:
+        reply, state = _build_pc_page(conn, chat_id, page)
     else:
         reply = render_page(conn, chat_id, page)
     return reply, state or {}
@@ -817,6 +1030,7 @@ def _enter(conn, chat_id, page, mode="push"):
     current_state = get_page_state(chat_id, conn=conn)
     current_page = current_state.get("page", "menu")
     stack = state_nav_stack(current_state)
+    _pause_pc_session_for_navigation(conn, chat_id, current_page, page)
 
     if mode == "reset":
         stack = default_nav_stack(page)
@@ -836,11 +1050,13 @@ def _enter(conn, chat_id, page, mode="push"):
 
 def _navigate_back(conn, chat_id):
     state = get_page_state(chat_id, conn=conn)
+    current_page = state.get("page", "menu")
     stack = state_nav_stack(state)
     if len(stack) <= 1:
         return _enter(conn, chat_id, "menu", mode="reset")
 
     target = stack[-2]
+    _pause_pc_session_for_navigation(conn, chat_id, current_page, target)
     next_stack = stack[:-1]
     reply, extra_state = _render_page_state(conn, chat_id, target)
     extra_state["nav_stack"] = next_stack
@@ -866,8 +1082,11 @@ def _handle_page_number(conn, chat_id, page, text):
             "4": "memory",
             "5": "help",
             "6": "notify",
+            "7": "pc",
         }.get(text)
         if target:
+            if target == "pc" and not _pc_control_enabled(conn):
+                return "🖥 本机 Codex 暂时关闭"
             return _enter(conn, chat_id, target)
 
     elif page == "status":
@@ -901,6 +1120,243 @@ def _handle_page_number(conn, chat_id, page, text):
             return _enter(conn, chat_id, "records")
 
     return None
+
+
+def _pc_event_key(event_id):
+    return event_id or f"pc-direct-{time.time_ns()}"
+
+
+def _pc_job_ack(suffix=""):
+    line = "✅ 已提交到本机 Codex\n正在等待电脑执行"
+    if suffix:
+        return f"{line}\n{suffix}"
+    return line
+
+
+def _handle_pc_context(conn, chat_id, page, text, event_id=None):
+    if text == "0":
+        return _navigate_back(conn, chat_id)
+
+    if not _pc_control_enabled(conn):
+        return "🖥 本机 Codex 暂时关闭\n\n0 返回"
+
+    if len(text) > 20000:
+        return "😅 任务太长了，20000 字以内"
+
+    online, health = pc_control_service.health_snapshot()
+    event_key = _pc_event_key(event_id)
+
+    if page == "pc":
+        target = {
+            "1": "pc_single",
+            "2": "pc_fixed",
+            "3": "pc_history",
+        }.get(text)
+        if target:
+            return _enter(conn, chat_id, target)
+        return PAGE_UNKNOWN_HINT["pc"]
+
+    if page == "pc_single":
+        if not online:
+            return pc_pages.render_pc_single(online, health)
+        existing = pc_control_store.get_job_by_event(
+            event_key, conn=conn
+        )
+        if existing is None:
+            active_job = pc_control_store.get_active_job_for_device(
+                PC_DEVICE_ID, conn=conn
+            )
+            if active_job is not None:
+                return (
+                    "🖥 电脑正在执行另一个任务\n\n"
+                    "本机同一时间只执行一个任务。"
+                )
+            existing = pc_control_store.create_job(
+                OWNER_OPEN_ID,
+                chat_id,
+                None,
+                PC_DEVICE_ID,
+                PC_PROFILE_ID,
+                "single",
+                text,
+                event_key,
+                conn=conn,
+            )
+        home = _enter(conn, chat_id, "pc", mode="replace")
+        return f"{_pc_job_ack()}\n\n{home}"
+
+    if page == "pc_fixed_new":
+        if not online:
+            return pc_pages.render_pc_fixed_new(online, health)
+        existing = pc_control_store.get_job_by_event(
+            event_key, conn=conn
+        )
+        if existing is None:
+            active_job = pc_control_store.get_active_job_for_device(
+                PC_DEVICE_ID, conn=conn
+            )
+            if active_job is not None:
+                return (
+                    "🖥 电脑正在执行另一个任务\n\n"
+                    "请等待完成或先中断当前任务。"
+                )
+            session_id = pc_control_store.create_session(
+                OWNER_OPEN_ID,
+                chat_id,
+                PC_DEVICE_ID,
+                PC_PROFILE_ID,
+                pc_pages.task_title(text),
+                conn=conn,
+            )
+            pc_control_store.activate_session(
+                OWNER_OPEN_ID, chat_id, session_id, conn=conn
+            )
+            existing = pc_control_store.create_job(
+                OWNER_OPEN_ID,
+                chat_id,
+                session_id,
+                PC_DEVICE_ID,
+                PC_PROFILE_ID,
+                "fixed",
+                text,
+                event_key,
+                conn=conn,
+            )
+        fixed_page = _enter(
+            conn, chat_id, "pc_fixed", mode="replace"
+        )
+        return f"{_pc_job_ack()}\n\n{fixed_page}"
+
+    if page == "pc_fixed":
+        active = pc_control_store.get_active_session(
+            OWNER_OPEN_ID, chat_id, conn=conn
+        )
+        if active is None:
+            recoverable = pc_control_store.list_recoverable_sessions(
+                OWNER_OPEN_ID, chat_id, conn=conn
+            )
+            if text in {"1", "2"}:
+                index = int(text) - 1
+                if index < len(recoverable):
+                    pc_control_store.activate_session(
+                        OWNER_OPEN_ID,
+                        chat_id,
+                        recoverable[index]["id"],
+                        conn=conn,
+                    )
+                    return _enter(
+                        conn, chat_id, "pc_fixed", mode="replace"
+                    )
+            if text == "3":
+                return _enter(conn, chat_id, "pc_fixed_new")
+            return (
+                "🖥 请选择要恢复的会话，或发送 3 新建固定会话\n\n"
+                "0 返回"
+            )
+
+        active_job = pc_control_store.get_active_job_for_device(
+            PC_DEVICE_ID, conn=conn
+        )
+
+        if text == "1":
+            return pc_pages.render_pc_job_status(active_job)
+
+        if text == "2":
+            if active_job is None:
+                return "🖥 当前没有执行中的任务\n\n继续发送任务即可"
+            requested = pc_control_store.request_job_cancel(
+                active_job["id"],
+                conn=conn,
+            )
+            if requested:
+                return (
+                    "🧹 已请求中断当前任务\n"
+                    "后台会确认本机执行状态。"
+                )
+            return "🖥 这个任务已经结束，不需要中断"
+
+        if text == "3":
+            if active_job is not None:
+                return "🖥 当前任务还在执行，先发送 2 中断"
+            pc_control_store.pause_active_session(
+                OWNER_OPEN_ID, chat_id, conn=conn
+            )
+            return _enter(conn, chat_id, "pc_fixed_new")
+
+        if active_job is not None:
+            state = pc_pages.JOB_LABELS.get(
+                active_job["status"], active_job["status"]
+            )
+            return (
+                f"🖥 当前任务仍在{state}\n\n"
+                "发送 1 查看状态，或 2 中断"
+            )
+
+        if not online:
+            return pc_pages.render_pc_fixed(
+                active,
+                pc_control_store.list_recoverable_sessions(
+                    OWNER_OPEN_ID, chat_id, conn=conn
+                ),
+                active_job,
+                online,
+                health,
+                pc_control_store.count_session_turns(
+                    active["id"], conn=conn
+                ),
+            )
+
+        existing = pc_control_store.get_job_by_event(
+            event_key, conn=conn
+        )
+        if existing is None:
+            existing = pc_control_store.create_job(
+                OWNER_OPEN_ID,
+                chat_id,
+                active["id"],
+                PC_DEVICE_ID,
+                PC_PROFILE_ID,
+                "fixed",
+                text,
+                event_key,
+                conn=conn,
+            )
+        fixed_page = _render_page_state(
+            conn, chat_id, "pc_fixed"
+        )[0]
+        return f"{_pc_job_ack()}\n\n{fixed_page}"
+
+    if page == "pc_history":
+        state = get_page_state(chat_id, conn=conn)
+        job_ids = state.get("history_job_ids") or []
+        if text.isdigit():
+            index = int(text) - 1
+            if 0 <= index < len(job_ids):
+                job = pc_control_store.get_history_job(
+                    job_ids[index],
+                    OWNER_OPEN_ID,
+                    chat_id,
+                    conn=conn,
+                )
+                stack = state_nav_stack(state) + [
+                    "pc_history_detail"
+                ]
+                set_page(
+                    chat_id,
+                    "pc_history_detail",
+                    state={
+                        "history_job_id": job_ids[index],
+                        "nav_stack": stack,
+                    },
+                    conn=conn,
+                )
+                return pc_pages.render_pc_history_detail(job)
+        return PAGE_UNKNOWN_HINT["pc_history"]
+
+    if page == "pc_history_detail":
+        return PAGE_UNKNOWN_HINT["pc_history_detail"]
+
+    return PAGE_UNKNOWN_HINT.get(page, "🖥 本机 Codex\n\n0 返回")
 
 
 def _add_todo(conn, chat_id, date_text, time_text, title):
@@ -1076,9 +1532,14 @@ def _handle_todo_action(conn, text, chat_id):
     )
 
 
-def handle_command(conn, text, chat_id):
+def handle_command(conn, text, chat_id, event_id=None):
     text = text.strip()
     page = get_page(chat_id, conn=conn)
+
+    if page in PC_PAGES:
+        return _handle_pc_context(
+            conn, chat_id, page, text, event_id=event_id
+        )
 
     todo_action = _handle_todo_action(conn, text, chat_id)
     if todo_action is not None:
@@ -1126,7 +1587,7 @@ def handle_command(conn, text, chat_id):
 
     if text.isdigit():
         handled = None
-        if text in {"1", "2", "3", "4", "5", "6"}:
+        if text in {"1", "2", "3", "4", "5", "6", "7"}:
             handled = _handle_page_number(conn, chat_id, page, text)
         if handled is not None:
             return handled
@@ -1135,7 +1596,7 @@ def handle_command(conn, text, chat_id):
                 page,
                 "😅 本页没有这个数字操作\n0 返回",
             )
-        return "😅 主菜单没有这个编号\n请输入 1 到 6"
+        return "😅 主菜单没有这个编号\n请输入 1 到 7"
 
     # -------- 直接进入页面的文字命令 --------
 
@@ -1168,6 +1629,11 @@ def handle_command(conn, text, chat_id):
 
     if text in {"添加待办", "新建待办"}:
         return _enter(conn, chat_id, "todo_new", mode="reset")
+
+    if text in {"本机 Codex", "本机Codex", "电脑控制", "本机电脑"}:
+        if not _pc_control_enabled(conn):
+            return "🖥 本机 Codex 暂时关闭"
+        return _enter(conn, chat_id, "pc", mode="reset")
 
     # -------- 静音设置 --------
 
@@ -1412,7 +1878,7 @@ def handle_command(conn, text, chat_id):
             "0 返回"
         )
 
-    # -------- 页面上下文：只有 todo_new 要求结构化输入 --------
+    # -------- 页面上下文：PC 页面已在入口处分流 --------
 
     if page == "todo_new":
         parsed = _parse_natural_todo(text, allow_time_only=True)
@@ -1491,7 +1957,7 @@ def _normalize_memory(text):
 
 def load_memory_context(limit=MEMORY_CONTEXT_LIMIT):
     """读取最近记忆，去重后返回列表。"""
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         rows = conn.execute(
             """
@@ -1934,6 +2400,10 @@ CHAT_TOOLS = [
         },
     },
 ]
+READ_ONLY_TOOLS = [
+    tool for tool in CHAT_TOOLS
+    if tool["function"]["name"] not in agent_runtime.WRITE_TOOLS
+]
 
 
 def _tool_get_weather(args):
@@ -2027,7 +2497,7 @@ def _tool_get_weather(args):
 
 
 def _tool_list_todos(args):
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         rows = conn.execute(
             """
@@ -2059,7 +2529,7 @@ def _tool_list_todos(args):
 def _tool_search_memories(args):
     keyword = (args.get("keyword") or "").strip()
 
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         if keyword:
             rows = conn.execute(
@@ -2093,11 +2563,28 @@ def _tool_search_memories(args):
 
 
 def _tool_add_todo(args):
-    title = (args.get("title") or "").strip()
+    title = (
+        args.get("title")
+        or args.get("content")
+        or args.get("description")
+        or ""
+    ).strip()
     due_text = (args.get("due_at") or "").strip()
     due = assistant_actions._parse_local_datetime(due_text)
-    if not title or due is None:
-        return {"ok": False, "error": "缺少待办标题或有效时间"}
+    if not title:
+        return {"ok": False, "error": "empty", "due_at": due_text}
+    if due is None:
+        return {"ok": False, "error": "bad_due", "due_at": due_text}
+
+    now_local = datetime.now(LOCAL_TZ)
+    readable_due = due.strftime("%Y-%m-%d %H:%M")
+    if due <= now_local:
+        return {
+            "ok": False,
+            "error": "past_due",
+            "due_text": readable_due,
+            "current_time": now_local.strftime("%Y-%m-%d %H:%M"),
+        }
 
     todo_id, result = echomate_store.create_todo(
         OWNER_OPEN_ID,
@@ -2109,7 +2596,16 @@ def _tool_add_todo(args):
         notify_feishu=True,
     )
     if result not in ("created", "duplicate"):
-        return {"ok": False, "error": result}
+        response = {
+            "ok": False,
+            "error": result,
+            "due_text": readable_due,
+        }
+        if result == "past_due":
+            response["current_time"] = datetime.now(LOCAL_TZ).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        return response
     return {
         "ok": True,
         "todo_id": todo_id,
@@ -2223,7 +2719,10 @@ def _run_tool(name, arguments):
         args = {}
 
     try:
-        return handler(args)
+        result = handler(args)
+        ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        print(f"[工具] {name} ok={str(ok).lower()}", flush=True)
+        return result
     except Exception as exc:
         print(f"[工具] {name} 执行失败：{type(exc).__name__}", flush=True)
         return {"ok": False, "error": "工具执行失败"}
@@ -2232,15 +2731,16 @@ def _run_tool(name, arguments):
 MAX_TOOL_ROUNDS = 4
 
 
-def _chat_with_tools(messages):
-    """跑工具调用循环，返回最终自然语言回复。"""
+def _chat_with_tools(messages, tools):
+    """跑工具调用循环，返回最终回复和真实工具执行记录。"""
     working = list(messages)
+    tool_runs = []
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = qwen_client.chat.completions.create(
             model=QWEN_MODEL,
             messages=working,
-            tools=CHAT_TOOLS,
+            tools=tools,
             tool_choice="auto",
             max_tokens=700,
         )
@@ -2250,7 +2750,8 @@ def _chat_with_tools(messages):
 
         if not tool_calls:
             content = message.content
-            return content.strip() if isinstance(content, str) else ""
+            reply = content.strip() if isinstance(content, str) else ""
+            return reply, tool_runs
 
         # 把助手的 tool_calls 原样放回对话，再逐个回填结果。
         working.append({
@@ -2272,6 +2773,11 @@ def _chat_with_tools(messages):
         for call in tool_calls:
             result = _run_tool(
                 call.function.name, call.function.arguments
+            )
+            tool_runs.append(
+                agent_runtime.normalize_tool_run(
+                    call.function.name, result
+                )
             )
             payload = json.dumps(result, ensure_ascii=False)
 
@@ -2299,7 +2805,38 @@ def _chat_with_tools(messages):
         max_tokens=700,
     )
     content = final.choices[0].message.content
-    return content.strip() if isinstance(content, str) else ""
+    reply = content.strip() if isinstance(content, str) else ""
+    return reply, tool_runs
+
+
+def _execute_planned_actions(actions):
+    tool_runs = []
+    for action in actions:
+        arguments = json.dumps(
+            action["arguments"], ensure_ascii=False
+        )
+        result = _run_tool(action["name"], arguments)
+        tool_runs.append(
+            agent_runtime.normalize_tool_run(action["name"], result)
+        )
+    return tool_runs
+
+
+def _compose_or_fallback(user_text, tool_runs):
+    try:
+        return agent_runtime.compose_grounded_reply(
+            qwen_client,
+            QWEN_MODEL,
+            user_text,
+            tool_runs,
+            datetime.now(LOCAL_TZ),
+        )
+    except Exception as exc:
+        print(
+            f"[动作回复] 校验失败，使用保底文案：{type(exc).__name__}",
+            flush=True,
+        )
+        return agent_runtime.fallback_action_reply(tool_runs)
 
 
 def generate_ai_reply(chat_id, user_text):
@@ -2311,7 +2848,7 @@ def generate_ai_reply(chat_id, user_text):
         return "😅 消息太长了，4000 字以内"
 
     # 先读取历史，再关闭数据库连接，避免网络请求期间占用数据库。
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         rows = conn.execute(
             """
@@ -2330,6 +2867,7 @@ def generate_ai_reply(chat_id, user_text):
         {"role": role, "content": content}
         for role, content in reversed(rows)
     ]
+    safe_history = agent_runtime.sanitize_history(history)
 
     memory_items = load_memory_context()
 
@@ -2340,9 +2878,10 @@ def generate_ai_reply(chat_id, user_text):
                 "你是 Echo-Mate，用户的个人助手。"
                 "你已连接共享待办和记忆。"
                 f"当前北京时间是 {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')}。"
-                "用户表达新建、提醒或安排待办的意图时，调用 add_todo，"
-                "不要把自由文本要求成固定格式。"
                 "用简体中文自然对话，像朋友聊天，简洁但有信息量。\n"
+                "普通聊天只负责回答和只读查询；写操作由前置动作层执行。\n"
+                "聊天历史只用于语境，不代表业务状态；"
+                "只有在当前轮工具返回 ok=true 时才能声称操作完成。\n"
                 "不要套固定格式，不要每次都列清单，"
                 "不要加「0 返回」这类导航提示。\n\n"
                 "你可以调用工具获取实时信息：\n"
@@ -2361,32 +2900,70 @@ def generate_ai_reply(chat_id, user_text):
                 "4. 如果多个结果说法冲突，指出冲突，不要挑一个当结论。\n"
                 "5. 回答末尾附 1-3 个来源，格式：标题 - URL。\n"
                 "工具返回 ok=false 时如实说明，不要编造数据。\n\n"
-                "长期偏好或个人信息只调用 propose_memory 生成候选，"
-                "必须由用户确认，不能声称已永久保存。\n"
                 "问天气时，如果用户说今天/明天/后天，"
                 "调用 get_weather 并传对应 day_offset。"
                 + memory_system_block(memory_items)
             ),
         },
-        *history,
+        *safe_history,
         {"role": "user", "content": user_text},
     ]
 
-    try:
-        reply = _chat_with_tools(messages)
-        if not reply:
-            return "😅 这次没想出来，换个说法试试"
+    now = datetime.now(LOCAL_TZ)
+    explicit_action = agent_runtime.parse_explicit_reminder(
+        user_text, now
+    )
+    if explicit_action is not None:
+        plan = {"actions": [explicit_action], "clarification": ""}
+        print("[动作计划] 使用明确时间快速路径", flush=True)
+    else:
+        try:
+            plan = agent_runtime.plan_actions(
+                qwen_client,
+                QWEN_MODEL,
+                user_text,
+                now,
+            )
+            print(
+                f"[动作计划] actions={len(plan['actions'])}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[动作计划] 失败，异常类型={type(exc).__name__}",
+                flush=True,
+            )
+            plan = {"actions": [], "clarification": ""}
 
-    except Exception as exc:
-        # 避免将请求内容或凭证写入日志。
-        print(
-            f"[Qwen] 请求失败，异常类型={type(exc).__name__}",
-            flush=True,
-        )
-        return "😅 AI 卡了一下，稍后再试"
+    if plan["actions"]:
+        tool_runs = _execute_planned_actions(plan["actions"])
+        if all(run["ok"] for run in tool_runs):
+            reply = _compose_or_fallback(user_text, tool_runs)
+        else:
+            reply = agent_runtime.fallback_action_reply(tool_runs)
+    elif plan["clarification"]:
+        reply = plan["clarification"]
+    else:
+        try:
+            reply, tool_runs = _chat_with_tools(
+                messages, READ_ONLY_TOOLS
+            )
+            if not reply:
+                return "😅 这次没想出来，换个说法试试"
+
+            if agent_runtime.looks_like_completion_claim(reply):
+                reply = agent_runtime.false_action_reply()
+
+        except Exception as exc:
+            # 避免将请求内容或凭证写入日志。
+            print(
+                f"[Qwen] 请求失败，异常类型={type(exc).__name__}",
+                flush=True,
+            )
+            return "😅 AI 卡了一下，稍后再试"
 
     # 只有成功获得回答后才保存本轮聊天。
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = open_connection(DB_PATH)
     try:
         with conn:
             conn.execute(
@@ -2427,7 +3004,7 @@ def generate_ai_reply(chat_id, user_text):
     finally:
         conn.close()
 
-    print("[Qwen] 普通聊天回复成功", flush=True)
+    print("[回复] 已生成", flush=True)
     return reply
 
 
@@ -2459,14 +3036,47 @@ def send_text(receive_id, text, receive_id_type="chat_id"):
     return False
 
 
+def send_card(receive_id, card, receive_id_type="chat_id"):
+    request = (
+        lark.im.v1.CreateMessageRequest.builder()
+        .receive_id_type(receive_id_type)
+        .request_body(
+            lark.im.v1.CreateMessageRequestBody.builder()
+            .receive_id(receive_id)
+            .msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False))
+            .build()
+        )
+        .build()
+    )
+
+    response = api_client.im.v1.message.create(request)
+
+    if response.success():
+        print("[飞书] 卡片发送成功", flush=True)
+        return True
+
+    print(
+        f"[飞书] 卡片发送失败：code={response.code}, "
+        f"msg={response.msg}, log_id={response.get_log_id()}",
+        flush=True,
+    )
+    return False
+
+
+def send_page_card(chat_id, page, text):
+    if send_card(chat_id, build_page_card(page, text)):
+        return True
+    return send_text(chat_id, text)
+
+
 # ==================== 到期提醒线程 ====================
 
 def reminder_loop():
-    print("[待办] 共享提醒调度器已启动，检查间隔 15 秒", flush=True)
+    print("[待办] 飞书提醒投递线程已启动，检查间隔 15 秒", flush=True)
 
     while True:
         try:
-            echomate_store.materialize_due_reminders()
             delivery = echomate_store.claim_delivery("feishu")
 
             if delivery:
@@ -2562,12 +3172,11 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
         return
 
     CURRENT_CHAT_ID.set(message.chat_id)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
     reply = None
+    reply_page = None
 
     try:
-        with conn:
+        with sqlite_connect(DB_PATH, write=True) as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO processed_events
@@ -2581,7 +3190,15 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
                 print("[飞书] 重复事件已忽略", flush=True)
                 return
 
-            reply = handle_command(conn, user_text, message.chat_id)
+        with sqlite_connect(DB_PATH, write=True) as conn:
+            reply = handle_command(
+                conn,
+                user_text,
+                message.chat_id,
+                event_id=event_id,
+            )
+            if reply is not None:
+                reply_page = get_page(message.chat_id, conn=conn)
 
     except Exception as exc:
         print(
@@ -2589,9 +3206,6 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
             flush=True,
         )
         reply = "😅 这条消息保存失败，请稍后重试。\n\n不会重复创建，直接重发即可。"
-    finally:
-        conn.close()
-
     if reply is None:
         match = re.match(
             r"^(?:记住|保存记忆)(?:\s*[:：]\s*|\s+)(.+)$",
@@ -2599,10 +3213,9 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
             re.DOTALL,
         )
         if match:
-            with db_conn() as mem_conn:
-                candidate_id, result = memory_store.enqueue_candidate(
-                    OWNER_OPEN_ID, match.group(1).strip()
-                )
+            candidate_id, result = memory_store.enqueue_candidate(
+                OWNER_OPEN_ID, match.group(1).strip()
+            )
             if result == "created":
                 reply = f"📝 已生成记忆候选 #{candidate_id}\n确认请发：确认记忆 #{candidate_id}\n取消请发：取消记忆 #{candidate_id}"
             elif result == "duplicate":
@@ -2617,7 +3230,10 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
     if reply:
         try:
-            send_text(message.chat_id, reply)
+            if reply_page:
+                send_page_card(message.chat_id, reply_page, reply)
+            else:
+                send_text(message.chat_id, reply)
         except Exception as exc:
             print(
                 f"[飞书] 回复异常：{type(exc).__name__}",
@@ -2627,31 +3243,40 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 
 # ==================== 启动 ====================
 
-init_db()
-init_chat_table()
-echomate_store.init_schema()
+def main():
+    init_db()
+    init_chat_table()
+    echomate_store.init_schema()
+    pc_control_store.init_schema()
+    pc_control_store.pause_all_active_sessions()
 
-threading.Thread(
-    target=reminder_loop,
-    name="todo-reminder",
-    daemon=True,
-).start()
+    threading.Thread(
+        target=reminder_loop,
+        name="todo-reminder",
+        daemon=True,
+    ).start()
 
-handler = (
-    lark.EventDispatcherHandler.builder("", "")
-    .register_p2_im_message_receive_v1(on_message)
-    .build()
-)
+    pc_control_service.start_worker(send_text)
 
-client = lark.ws.Client(
-    APP_ID,
-    APP_SECRET,
-    event_handler=handler,
-)
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(on_message)
+        .build()
+    )
 
-print("[记忆助手] SQLite 初始化完成", flush=True)
-print("[记忆助手] 记忆和待办仅允许授权账号私聊操作", flush=True)
-print(f"[记忆助手] 数据库位置：{DB_PATH}", flush=True)
-print("[飞书] 正在连接开放平台……", flush=True)
+    client = lark.ws.Client(
+        APP_ID,
+        APP_SECRET,
+        event_handler=handler,
+    )
 
-client.start()
+    print("[记忆助手] SQLite 初始化完成", flush=True)
+    print("[记忆助手] 记忆和待办仅允许授权账号私聊操作", flush=True)
+    print(f"[记忆助手] 数据库位置：{DB_PATH}", flush=True)
+    print("[飞书] 正在连接开放平台……", flush=True)
+
+    client.start()
+
+
+if __name__ == "__main__":
+    main()

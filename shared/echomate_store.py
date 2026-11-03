@@ -16,6 +16,7 @@ from sqlite_db import retry_locked
 DB_PATH = Path("/var/lib/echomate/assistant.db")
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 MAX_MEMORY_LENGTH = 2000
+MAX_CHAT_MEMORY_LENGTH = 500
 
 
 def now_utc():
@@ -58,6 +59,23 @@ def init_schema():
             CREATE INDEX IF NOT EXISTS idx_memory_candidates_pending
                 ON memory_candidates(status, owner_id, id);
 
+            CREATE TABLE IF NOT EXISTS chat_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                source_turn_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'chat',
+                kind TEXT NOT NULL DEFAULT 'chat',
+                content TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                created_at_utc TEXT NOT NULL,
+                expires_at_utc TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_memories_owner
+                ON chat_memories(owner_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_chat_memories_session
+                ON chat_memories(owner_id, session_id, id DESC);
+
             CREATE TABLE IF NOT EXISTS todos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id TEXT NOT NULL,
@@ -97,6 +115,24 @@ def init_schema():
             conn.execute("ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'feishu'")
         if "updated_at" not in memory_columns:
             conn.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT")
+        if "memory_key" not in memory_columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN memory_key TEXT")
+        if "confidence" not in memory_columns:
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"
+            )
+        if "evidence_count" not in memory_columns:
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 1"
+            )
+        if "last_seen_at_utc" not in memory_columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN last_seen_at_utc TEXT")
+        if "source_turn_id" not in memory_columns:
+            conn.execute("ALTER TABLE memories ADD COLUMN source_turn_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_key "
+            "ON memories(owner_id, memory_key)"
+        )
 
         todo_columns = {r["name"] for r in conn.execute("PRAGMA table_info(todos)")}
         additions = {
@@ -154,6 +190,209 @@ def memory_context(owner_id, limit=50):
         if len(result) >= limit:
             break
     return result
+
+
+def add_chat_memory(owner_id, content, session_id="", source_turn_id="",
+                    source="chat", kind="chat", expires_days=90, conn=None):
+    content = (content or "").strip()
+    if not content:
+        return None, "empty"
+    if len(content) > MAX_CHAT_MEMORY_LENGTH:
+        return None, "too_long"
+
+    expires_at = None
+    if expires_days:
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=int(expires_days))
+        ).isoformat(timespec="seconds")
+    dedupe_raw = (
+        f"{owner_id}|{session_id}|{source_turn_id}|{_normalize(content)}"
+    ).encode("utf-8")
+    dedupe_key = "chat-memory:" + hashlib.sha256(dedupe_raw).hexdigest()
+    if conn is not None:
+        return _add_chat_memory(
+            conn, owner_id, content, session_id, source_turn_id, source,
+            kind, dedupe_key, expires_at
+        )
+    with write_connect() as owned_conn:
+        return _add_chat_memory(
+            owned_conn, owner_id, content, session_id, source_turn_id, source,
+            kind, dedupe_key, expires_at
+        )
+
+
+def _add_chat_memory(conn, owner_id, content, session_id, source_turn_id,
+                     source, kind, dedupe_key, expires_at):
+    existing = conn.execute(
+        "SELECT id FROM chat_memories WHERE dedupe_key = ?",
+        (dedupe_key,),
+    ).fetchone()
+    if existing:
+        return existing["id"], "duplicate"
+    cursor = conn.execute(
+        """
+        INSERT INTO chat_memories
+            (owner_id, session_id, source_turn_id, source, kind, content,
+             dedupe_key, created_at_utc, expires_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            owner_id, session_id or "", source_turn_id or "", source or "chat",
+            kind or "chat", content, dedupe_key, now_utc(), expires_at,
+        ),
+    )
+    return cursor.lastrowid, "created"
+
+
+def list_chat_memories(owner_id, limit=50, offset=0, conn=None):
+    sql = """
+        SELECT id, session_id, source_turn_id, source, kind, content,
+               created_at_utc, expires_at_utc
+        FROM chat_memories
+        WHERE owner_id = ?
+          AND (expires_at_utc IS NULL OR expires_at_utc > ?)
+        ORDER BY id DESC LIMIT ? OFFSET ?
+    """
+    params = (owner_id, now_utc(), int(limit), int(offset))
+    if conn is not None:
+        rows = conn.execute(sql, params).fetchall()
+    else:
+        with connect() as owned_conn:
+            rows = owned_conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _memory_query_terms(text):
+    value = _normalize(text)
+    if not value:
+        return set()
+    terms = {value[index:index + 2] for index in range(len(value) - 1)}
+    terms.update(re.findall(r"[a-z0-9]{2,}", value))
+    return terms
+
+
+def search_chat_memories(owner_id, query, exclude_session_id="", limit=5):
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, session_id, source, kind, content, created_at_utc
+            FROM chat_memories
+            WHERE owner_id = ?
+              AND (expires_at_utc IS NULL OR expires_at_utc > ?)
+              AND session_id != ?
+            ORDER BY id DESC LIMIT 200
+            """,
+            (owner_id, now_utc(), exclude_session_id or ""),
+        ).fetchall()
+
+    terms = _memory_query_terms(query)
+    recall_requested = any(
+        word in (query or "")
+        for word in ("上次", "之前", "以前", "记得", "聊过", "提到")
+    )
+    scored = []
+    for row in rows:
+        item_terms = _memory_query_terms(row["content"])
+        overlap = len(terms & item_terms)
+        if recall_requested:
+            overlap += 1
+        if overlap <= 0:
+            continue
+        scored.append((overlap, row["id"], dict(row)))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored[:max(1, int(limit))]]
+
+
+def delete_chat_memory(owner_id, memory_id, conn=None):
+    if conn is not None:
+        return _delete_chat_memory(conn, owner_id, memory_id)
+    with write_connect() as owned_conn:
+        return _delete_chat_memory(owned_conn, owner_id, memory_id)
+
+
+def _delete_chat_memory(conn, owner_id, memory_id):
+    cursor = conn.execute(
+        "DELETE FROM chat_memories WHERE id = ? AND owner_id = ?",
+        (int(memory_id), owner_id),
+    )
+    return cursor.rowcount > 0
+
+
+def clear_chat_memories(owner_id, conn=None):
+    if conn is not None:
+        return _clear_chat_memories(conn, owner_id)
+    with write_connect() as owned_conn:
+        return _clear_chat_memories(owned_conn, owner_id)
+
+
+def _clear_chat_memories(conn, owner_id):
+    cursor = conn.execute(
+        "DELETE FROM chat_memories WHERE owner_id = ?",
+        (owner_id,),
+    )
+    return cursor.rowcount
+
+
+def upsert_preference_memory(owner_id, content, memory_key, source,
+                             confidence=1.0, source_turn_id="", conn=None):
+    content = (content or "").strip()
+    memory_key = (memory_key or "").strip()
+    if not content or not memory_key:
+        return None, "empty"
+    if len(content) > MAX_MEMORY_LENGTH:
+        return None, "too_long"
+    if conn is not None:
+        return _upsert_preference_memory(
+            conn, owner_id, content, memory_key, source, confidence,
+            source_turn_id
+        )
+    with write_connect() as owned_conn:
+        return _upsert_preference_memory(
+            owned_conn, owner_id, content, memory_key, source, confidence,
+            source_turn_id
+        )
+
+
+def _upsert_preference_memory(conn, owner_id, content, memory_key, source,
+                              confidence, source_turn_id):
+    row = conn.execute(
+        """
+        SELECT id FROM memories
+        WHERE owner_id = ? AND memory_key = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (owner_id, memory_key),
+    ).fetchone()
+    now = now_utc()
+    if row:
+        conn.execute(
+            """
+            UPDATE memories
+            SET content = ?, category = 'preference', source = ?,
+                updated_at = ?, confidence = ?, last_seen_at_utc = ?,
+                evidence_count = evidence_count + 1, source_turn_id = ?
+            WHERE id = ?
+            """,
+            (
+                content, source, now, float(confidence), now,
+                source_turn_id or "", row["id"],
+            ),
+        )
+        return row["id"], "updated"
+    cursor = conn.execute(
+        """
+        INSERT INTO memories
+            (owner_id, content, created_at, category, source, updated_at,
+             memory_key, confidence, evidence_count, last_seen_at_utc,
+             source_turn_id)
+        VALUES (?, ?, ?, 'preference', ?, ?, ?, ?, 1, ?, ?)
+        """,
+        (
+            owner_id, content, now, source, now, memory_key,
+            float(confidence), now, source_turn_id or "",
+        ),
+    )
+    return cursor.lastrowid, "created"
 
 
 def enqueue_memory_candidate(owner_id, content, source="ai_chat", category=None,

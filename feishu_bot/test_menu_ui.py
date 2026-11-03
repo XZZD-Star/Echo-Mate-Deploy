@@ -86,7 +86,7 @@ class MenuUITest(unittest.TestCase):
             "运行状态",
             "待办清单",
             "新建待办",
-            "长期记忆",
+            "长期偏好",
             "使用帮助",
             "语音播报",
             "本机 Codex",
@@ -179,6 +179,50 @@ class MenuUITest(unittest.TestCase):
         self.assertIn("确认候选 1", listing)
         self.assertNotIn("#", listing)
         self.assertIn("候选记忆已写入", accepted)
+
+    def test_chat_memory_page_uses_display_numbers(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute(
+                """
+                CREATE TABLE chat_memories (
+                    id INTEGER PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    source_turn_id TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'chat',
+                    kind TEXT NOT NULL DEFAULT 'chat',
+                    content TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    created_at_utc TEXT NOT NULL,
+                    expires_at_utc TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO chat_memories
+                    (owner_id, source_turn_id, content, dedupe_key,
+                     created_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    bot.OWNER_OPEN_ID,
+                    "turn-1",
+                    "用户最近在准备比赛",
+                    "test",
+                    bot.now_utc(),
+                ),
+            )
+            page, state = bot._build_chat_memory_page(conn)
+        finally:
+            conn.close()
+
+        self.assertIn("1. 用户最近在准备比赛", page)
+        self.assertIn("删除聊天记忆 1", page)
+        self.assertEqual(len(state["chat_memory_ids"]), 1)
+        self.assertNotIn("#", page)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,9 @@ sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
 from tools import notify_store
 from tools import memory_store
 import echomate_store
+import assistant_core
+import assistant_tools
+from memory_observer import MemoryObserver
 from services import assistant_actions
 from contextvars import ContextVar
 from sqlite_db import connect as sqlite_connect
@@ -175,7 +178,7 @@ def init_chat_table():
 PAGES = {
     "menu", "status", "status_detail", "todo", "todo_new",
     "todo_history",
-    "memory", "help", "notify", "quiet", "records",
+    "memory", "chat_memory", "help", "notify", "quiet", "records",
     "memory_clear_confirm",
     "pc", "pc_single", "pc_fixed", "pc_fixed_new",
     "pc_history", "pc_history_detail",
@@ -188,6 +191,7 @@ PAGE_PARENT = {
     "todo_history": "todo",
     "quiet": "notify",
     "records": "notify",
+    "chat_memory": "memory",
     "memory_clear_confirm": "memory",
     "pc_single": "pc",
     "pc_fixed": "pc",
@@ -241,6 +245,7 @@ PAGE_UNKNOWN_HINT = {
     "todo_new": "这里需要直接填写待办内容\n0 返回",
     "todo_history": "8 上一页 · 9 下一页 · 0 返回",
     "memory": "8 上一页 · 9 下一页 · 0 返回",
+    "chat_memory": "8 上一页 · 9 下一页 · 0 返回",
     "help": "帮助页可直接回复 0 返回",
     "notify": "这里没有这个编号\n请选择 1 到 4，或回复 0 返回",
     "quiet": "静音页请直接发送设置命令\n0 返回",
@@ -261,7 +266,8 @@ PAGE_CARD_CONFIG = {
     "todo": ("待办清单", "orange"),
     "todo_new": ("新建待办", "orange"),
     "todo_history": ("历史待办", "grey"),
-    "memory": ("长期记忆", "purple"),
+    "memory": ("长期偏好", "purple"),
+    "chat_memory": ("聊天记忆", "turquoise"),
     "help": ("使用帮助", "blue"),
     "notify": ("语音播报", "turquoise"),
     "quiet": ("静音设置", "grey"),
@@ -285,6 +291,7 @@ PAGE_CARD_DROP_FIRST = {
     "🔊 播报设置",
     "🌙 静音设置",
     "📢 播报记录",
+    "💬 聊天记忆",
     "⚠️ 清空全部记忆？",
 }
 
@@ -306,6 +313,7 @@ PAGED_PAGE_SIZES = {
     "todo": 8,
     "todo_history": 8,
     "memory": 5,
+    "chat_memory": 8,
     "records": 8,
     "pc_history": 6,
 }
@@ -521,7 +529,7 @@ def menu_text():
         "1 · 📊 运行状态\n"
         "2 · 📋 待办清单\n"
         "3 · ➕ 新建待办\n"
-        "4 · 📚 长期记忆\n"
+        "4 · 📚 长期偏好\n"
         "5 · 💡 使用帮助\n"
         "6 · 🔊 语音播报\n"
         "7 · 🖥 本机 Codex\n\n"
@@ -874,7 +882,7 @@ def _build_memory_page(conn, page_index=1):
 
     if not total:
         return (
-            "📚 记忆\n\n还没有记忆\n\n"
+            "📚 长期偏好\n\n还没有记忆\n\n"
             "💾 存记忆：记住 喜欢简短回答\n\n"
             "0 返回",
             {"pager": _pager_state(1, 0, page_size, [])},
@@ -888,7 +896,7 @@ def _build_memory_page(conn, page_index=1):
     )
     memory_ids = [row[0] for row in rows]
 
-    lines = [f"📚 记忆 · {total} 条", ""]
+    lines = [f"📚 长期偏好 · {total} 条", ""]
     for sequence, (_, content) in enumerate(rows, 1):
         lines.append(f"{sequence}. {content[:60]}")
 
@@ -897,6 +905,7 @@ def _build_memory_page(conn, page_index=1):
         "🔎 查记忆：查记忆 服务器",
         "💾 存记忆：记住 喜欢简短回答",
         "🗑 删除记忆：删除第 1 条",
+        "💬 聊天记忆：聊天记忆",
         "",
         *_pager_lines(page_index, total, page_size),
     ])
@@ -910,6 +919,56 @@ def _build_memory_page(conn, page_index=1):
 
 def render_memory(conn, page_index=1):
     return _build_memory_page(conn, page_index=page_index)[0]
+
+
+def _build_chat_memory_page(conn, page_index=1):
+    total = conn.execute(
+        """
+        SELECT COUNT(*) FROM chat_memories
+        WHERE owner_id = ?
+          AND (expires_at_utc IS NULL OR expires_at_utc > ?)
+        """,
+        (OWNER_OPEN_ID, now_utc()),
+    ).fetchone()[0]
+    page_size = PAGED_PAGE_SIZES["chat_memory"]
+    if not total:
+        return (
+            "💬 聊天记忆\n\n"
+            "还没有自动记住的聊天内容\n\n"
+            "0 返回",
+            {"pager": _pager_state(1, 0, page_size, [])},
+        )
+
+    page_index = _clamp_page(page_index, total, page_size)
+    rows = echomate_store.list_chat_memories(
+        OWNER_OPEN_ID,
+        limit=page_size,
+        offset=(page_index - 1) * page_size,
+        conn=conn,
+    )
+    item_ids = [row["id"] for row in rows]
+    lines = [f"💬 聊天记忆 · {total} 条", ""]
+    for sequence, row in enumerate(rows, 1):
+        try:
+            stamp = datetime.fromisoformat(
+                row["created_at_utc"]
+            ).astimezone(LOCAL_TZ).strftime("%m-%d")
+        except (TypeError, ValueError):
+            stamp = ""
+        lines.append(
+            f"{sequence}. {row['content'][:64]}"
+            + (f" · {stamp}" if stamp else "")
+        )
+    lines.extend([
+        "",
+        "🗑 删除：删除聊天记忆 1",
+        "",
+        *_pager_lines(page_index, total, page_size),
+    ])
+    return "\n".join(lines), {
+        "pager": _pager_state(page_index, total, page_size, item_ids),
+        "chat_memory_ids": item_ids,
+    }
 
 
 def render_help():
@@ -926,6 +985,7 @@ def render_help():
         "💾 存记忆：记住 喜欢简短回答\n"
         "🔎 查记忆：查记忆 服务器\n"
         "🗑 删除记忆：删除第 1 条\n\n"
+        "💬 聊天记忆：聊天记忆\n\n"
         "🔊 播报\n"
         "🌙 设置静音：静音 23:00 08:00\n"
         "☀️ 取消静音：关闭静音\n\n"
@@ -1142,6 +1202,8 @@ def render_page(conn, chat_id, page, page_index=1):
         return _build_todo_history_page(conn, page_index)[0]
     if page == "memory":
         return _build_memory_page(conn, page_index)[0]
+    if page == "chat_memory":
+        return _build_chat_memory_page(conn, page_index)[0]
     if page == "help":
         return render_help()
     if page == "notify":
@@ -1950,6 +2012,25 @@ def handle_command(conn, text, chat_id, event_id=None):
     if text in {"列出记忆", "我的记忆", "记忆列表", "记忆"}:
         return _enter(conn, chat_id, "memory", mode="reset")
 
+    if text in {"聊天记忆", "聊天记忆列表"}:
+        return _enter(conn, chat_id, "chat_memory", mode="reset")
+
+    match = re.match(r"^删除聊天记忆\s*(\d+)\s*$", text)
+    if match:
+        display_index = int(match.group(1))
+        state = get_page_state(chat_id, conn=conn)
+        ids = state.get("chat_memory_ids") or []
+        if not (1 <= display_index <= len(ids)):
+            return "没有找到这条聊天记忆\n\n聊天记忆"
+        if not echomate_store.delete_chat_memory(
+            OWNER_OPEN_ID, ids[display_index - 1], conn=conn
+        ):
+            return "这条聊天记忆已经不存在\n\n聊天记忆"
+        return (
+            "🗑 已删除聊天记忆\n\n"
+            + _enter(conn, chat_id, "chat_memory", mode="replace")
+        )
+
     if text in {"添加待办", "新建待办"}:
         return _enter(conn, chat_id, "todo_new", mode="reset")
 
@@ -2293,6 +2374,12 @@ if QWEN_API_KEY:
         timeout=35.0,
         max_retries=0,
     )
+
+memory_observer = (
+    MemoryObserver(qwen_client, QWEN_MODEL)
+    if qwen_client is not None
+    else None
+)
 
 
 MEMORY_CONTEXT_LIMIT = 50
@@ -2652,106 +2739,8 @@ def weather_reply(text):
     return "\n".join(lines)
 
 
-CHAT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": (
-                "查询某个地点的实时天气和未来几天预报。"
-                "用户问天气、气温、下雨、穿衣建议、温差、"
-                "未来几天冷不冷等问题时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "place": {
-                        "type": "string",
-                        "description": (
-                            "城市名。用户没指定时留空，"
-                            "系统会用记忆里的居住地。"
-                        ),
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "需要几天预报，1-7，默认 3",
-                    },
-                    "day_offset": {
-                        "type": "integer",
-                        "description": (
-                            "从哪天开始：0=今天，1=明天，2=后天。"
-                            "用户问明天天气时传 1。"
-                        ),
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_todos",
-            "description": (
-                "列出用户当前未完成的待办。"
-                "用户问有什么待办、今天要做什么、任务清单时调用。"
-            ),
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_memories",
-            "description": (
-                "在用户保存的记忆里按关键词搜索。"
-                "用户问起过去记过的事情、偏好、经历时调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "要搜索的关键词，留空则返回最近的记忆",
-                    }
-                },
-                "required": [],
-            },
-        },
-    },
-    assistant_actions.TODO_TOOL,
-    assistant_actions.MEMORY_TOOL,
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "联网搜索最新信息。"
-                "需要时效性内容（新闻、价格、版本发布、赛事）、"
-                "你不确定的事实、或用户明确要求查资料时调用。"
-                "日常闲聊、常识、你的知识足够回答的问题不要调用。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索关键词，尽量具体",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "返回条数，1-8，默认 5",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
-READ_ONLY_TOOLS = [
-    tool for tool in CHAT_TOOLS
-    if tool["function"]["name"] not in agent_runtime.WRITE_TOOLS
-]
+CHAT_TOOLS = assistant_core.CHAT_TOOLS
+READ_ONLY_TOOLS = assistant_core.READ_ONLY_TOOLS
 
 
 def _tool_get_weather(args):
@@ -3045,12 +3034,18 @@ def _tool_web_search(args):
 
 
 TOOL_HANDLERS = {
-    "get_weather": _tool_get_weather,
-    "list_todos": _tool_list_todos,
+    "get_weather": lambda args: assistant_tools.get_weather(
+        args, OWNER_OPEN_ID
+    ),
+    "list_todos": lambda args: assistant_tools.list_todos(
+        args, OWNER_OPEN_ID
+    ),
     "add_todo": _tool_add_todo,
     "propose_memory": _tool_propose_memory,
-    "search_memories": _tool_search_memories,
-    "web_search": _tool_web_search,
+    "search_memories": lambda args: assistant_tools.search_memories(
+        args, OWNER_OPEN_ID
+    ),
+    "web_search": assistant_tools.web_search,
 }
 
 
@@ -3187,7 +3182,7 @@ def _compose_or_fallback(user_text, tool_runs):
         return agent_runtime.fallback_action_reply(tool_runs)
 
 
-def generate_ai_reply(chat_id, user_text):
+def generate_ai_reply(chat_id, user_text, turn_id=""):
     """使用 Qwen 回复普通聊天，并保存近期上下文。"""
     if qwen_client is None:
         return "😅 AI 还没配好"
@@ -3216,8 +3211,9 @@ def generate_ai_reply(chat_id, user_text):
         for role, content in reversed(rows)
     ]
     safe_history = agent_runtime.sanitize_history(history)
-
-    memory_items = load_memory_context()
+    session_id = (
+        f"feishu:{datetime.now(LOCAL_TZ).date().isoformat()}:{chat_id}"
+    )
 
     messages = [
         {
@@ -3250,7 +3246,11 @@ def generate_ai_reply(chat_id, user_text):
                 "工具返回 ok=false 时如实说明，不要编造数据。\n\n"
                 "问天气时，如果用户说今天/明天/后天，"
                 "调用 get_weather 并传对应 day_offset。"
-                + memory_system_block(memory_items)
+                + assistant_actions.memory_prompt_block(
+                    OWNER_OPEN_ID,
+                    query=user_text,
+                    session_id=session_id,
+                )
             ),
         },
         *safe_history,
@@ -3258,6 +3258,7 @@ def generate_ai_reply(chat_id, user_text):
     ]
 
     now = datetime.now(LOCAL_TZ)
+    tool_runs = []
     explicit_action = agent_runtime.parse_explicit_reminder(
         user_text, now
     )
@@ -3351,6 +3352,21 @@ def generate_ai_reply(chat_id, user_text):
             )
     finally:
         conn.close()
+
+    if (
+        memory_observer is not None
+        and not any(
+            run.get("tool") == "propose_memory" for run in tool_runs
+        )
+    ):
+        memory_observer.enqueue_turn(
+            owner_id=OWNER_OPEN_ID,
+            session_id=session_id,
+            turn_id=turn_id or now_utc(),
+            source="feishu",
+            user_text=user_text,
+            tool_runs=tool_runs,
+        )
 
     print("[回复] 已生成", flush=True)
     return reply
@@ -3578,7 +3594,11 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
                 reply = "😅 要记的内容是空的"
 
     if reply is None:
-        reply = generate_ai_reply(message.chat_id, user_text)
+        reply = generate_ai_reply(
+            message.chat_id,
+            user_text,
+            turn_id=event_id,
+        )
 
     if reply:
         try:

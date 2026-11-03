@@ -102,7 +102,9 @@ LIST_TODOS_TOOL = _tool_descriptor(
 
 SEARCH_MEMORIES_TOOL = _tool_descriptor(
     "search_memories",
-    "在用户保存的长期记忆和聊天记忆里搜索。用户问起过去记过的事情、偏好、经历时调用。",
+    "在已保存的长期偏好和更早聊天记忆里搜索。"
+    "用户问起过去记过的事情、偏好、经历时调用；"
+    "询问上一轮、刚才或当前会话内容时不要调用，应使用 continue_chat。",
     {
         "keyword": {
             "type": "string",

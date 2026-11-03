@@ -178,7 +178,8 @@ def init_chat_table():
 PAGES = {
     "menu", "status", "status_detail", "todo", "todo_new",
     "todo_history",
-    "memory", "chat_memory", "help", "notify", "quiet", "records",
+    "memory_hub", "memory", "chat_memory", "help", "notify", "quiet",
+    "records",
     "memory_clear_confirm",
     "pc", "pc_single", "pc_fixed", "pc_fixed_new",
     "pc_history", "pc_history_detail",
@@ -191,7 +192,8 @@ PAGE_PARENT = {
     "todo_history": "todo",
     "quiet": "notify",
     "records": "notify",
-    "chat_memory": "memory",
+    "memory": "memory_hub",
+    "chat_memory": "memory_hub",
     "memory_clear_confirm": "memory",
     "pc_single": "pc",
     "pc_fixed": "pc",
@@ -246,6 +248,7 @@ PAGE_UNKNOWN_HINT = {
     "todo_history": "8 上一页 · 9 下一页 · 0 返回",
     "memory": "8 上一页 · 9 下一页 · 0 返回",
     "chat_memory": "8 上一页 · 9 下一页 · 0 返回",
+    "memory_hub": "请选择 1 或 2，或回复 0 返回",
     "help": "帮助页可直接回复 0 返回",
     "notify": "这里没有这个编号\n请选择 1 到 4，或回复 0 返回",
     "quiet": "静音页请直接发送设置命令\n0 返回",
@@ -268,6 +271,7 @@ PAGE_CARD_CONFIG = {
     "todo_history": ("历史待办", "grey"),
     "memory": ("长期偏好", "purple"),
     "chat_memory": ("聊天记忆", "turquoise"),
+    "memory_hub": ("记忆", "purple"),
     "help": ("使用帮助", "blue"),
     "notify": ("语音播报", "turquoise"),
     "quiet": ("静音设置", "grey"),
@@ -291,6 +295,7 @@ PAGE_CARD_DROP_FIRST = {
     "🔊 播报设置",
     "🌙 静音设置",
     "📢 播报记录",
+    "🧠 记忆",
     "💬 聊天记忆",
     "⚠️ 清空全部记忆？",
 }
@@ -529,7 +534,7 @@ def menu_text():
         "1 · 📊 运行状态\n"
         "2 · 📋 待办清单\n"
         "3 · ➕ 新建待办\n"
-        "4 · 📚 长期偏好\n"
+        "4 · 🧠 记忆\n"
         "5 · 💡 使用帮助\n"
         "6 · 🔊 语音播报\n"
         "7 · 🖥 本机 Codex\n\n"
@@ -921,6 +926,28 @@ def render_memory(conn, page_index=1):
     return _build_memory_page(conn, page_index=page_index)[0]
 
 
+def render_memory_hub(conn):
+    long_term_total = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE owner_id = ?",
+        (OWNER_OPEN_ID,),
+    ).fetchone()[0]
+    chat_total = conn.execute(
+        """
+        SELECT COUNT(*) FROM chat_memories
+        WHERE owner_id = ?
+          AND (expires_at_utc IS NULL OR expires_at_utc > ?)
+        """,
+        (OWNER_OPEN_ID, now_utc()),
+    ).fetchone()[0]
+    return (
+        "🧠 记忆\n\n"
+        "我会把记忆分成两类\n\n"
+        f"1 · 📚 长期偏好 · {long_term_total} 条\n"
+        f"2 · 💬 聊天记忆 · {chat_total} 条\n\n"
+        "0 返回"
+    )
+
+
 def _build_chat_memory_page(conn, page_index=1):
     total = conn.execute(
         """
@@ -981,7 +1008,8 @@ def render_help():
         "📄 查看待办：待办\n"
         "✅ 完成待办：完成 今天待办1\n"
         "🧹 取消待办：取消 明天待办1\n\n"
-        "📚 记忆\n"
+        "🧠 记忆\n"
+        "打开记忆中心：记忆\n"
         "💾 存记忆：记住 喜欢简短回答\n"
         "🔎 查记忆：查记忆 服务器\n"
         "🗑 删除记忆：删除第 1 条\n\n"
@@ -1200,6 +1228,8 @@ def render_page(conn, chat_id, page, page_index=1):
         return render_todo_new()
     if page == "todo_history":
         return _build_todo_history_page(conn, page_index)[0]
+    if page == "memory_hub":
+        return render_memory_hub(conn)
     if page == "memory":
         return _build_memory_page(conn, page_index)[0]
     if page == "chat_memory":
@@ -1444,7 +1474,7 @@ def _handle_page_number(conn, chat_id, page, text):
             "1": "status",
             "2": "todo",
             "3": "todo_new",
-            "4": "memory",
+            "4": "memory_hub",
             "5": "help",
             "6": "notify",
             "7": "pc",
@@ -1479,6 +1509,12 @@ def _handle_page_number(conn, chat_id, page, text):
             return _toggle("notify_monitor_enabled", "监控")
         if text == "4":
             return _enter(conn, chat_id, "records")
+
+    elif page == "memory_hub":
+        if text == "1":
+            return _enter(conn, chat_id, "memory")
+        if text == "2":
+            return _enter(conn, chat_id, "chat_memory")
 
     return None
 
@@ -2009,7 +2045,13 @@ def handle_command(conn, text, chat_id, event_id=None):
     if text in {"历史待办", "待办历史"}:
         return _enter(conn, chat_id, "todo_history", mode="reset")
 
-    if text in {"列出记忆", "我的记忆", "记忆列表", "记忆"}:
+    if text in {"记忆", "记忆中心"}:
+        return _enter(conn, chat_id, "memory_hub", mode="reset")
+
+    if text in {
+        "列出记忆", "我的记忆", "记忆列表",
+        "长期记忆", "长期偏好",
+    }:
         return _enter(conn, chat_id, "memory", mode="reset")
 
     if text in {"聊天记忆", "聊天记忆列表"}:

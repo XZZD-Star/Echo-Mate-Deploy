@@ -86,7 +86,7 @@ class MenuUITest(unittest.TestCase):
             "运行状态",
             "待办清单",
             "新建待办",
-            "长期偏好",
+            "记忆",
             "使用帮助",
             "语音播报",
             "本机 Codex",
@@ -223,6 +223,38 @@ class MenuUITest(unittest.TestCase):
         self.assertIn("删除聊天记忆 1", page)
         self.assertEqual(len(state["chat_memory_ids"]), 1)
         self.assertNotIn("#", page)
+
+    def test_memory_hub_exposes_both_memory_types(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    content TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE chat_memories (
+                    id INTEGER PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    expires_at_utc TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO memories (owner_id, content) VALUES (?, ?)",
+                (bot.OWNER_OPEN_ID, "喜欢简短回答"),
+            )
+            text = bot.render_memory_hub(conn)
+        finally:
+            conn.close()
+
+        self.assertIn("1 · 📚 长期偏好 · 1 条", text)
+        self.assertIn("2 · 💬 聊天记忆 · 0 条", text)
 
 
 if __name__ == "__main__":

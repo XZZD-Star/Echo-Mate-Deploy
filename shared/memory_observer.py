@@ -140,10 +140,13 @@ def observe_turn_now(client, model, *, owner_id, session_id, turn_id,
 class MemoryObserver:
     """One bounded background worker per service process."""
 
-    def __init__(self, client, model, *, max_queue=8, delay_seconds=2.0):
+    def __init__(self, client, model, *, max_queue=8, delay_seconds=2.0,
+                 can_process=None, poll_seconds=0.5):
         self.client = client
         self.model = model
         self.delay_seconds = max(0.0, float(delay_seconds))
+        self.poll_seconds = max(0.1, float(poll_seconds))
+        self._can_process = can_process or (lambda: True)
         self.queue = queue.Queue(maxsize=max(1, int(max_queue)))
         self._thread = threading.Thread(
             target=self._run,
@@ -173,12 +176,18 @@ class MemoryObserver:
         while True:
             job = self.queue.get()
             try:
-                if self.delay_seconds:
-                    time.sleep(self.delay_seconds)
+                while not self._wait_for_quiet_window():
+                    time.sleep(self.poll_seconds)
+                started = time.monotonic()
                 observe_turn_now(
                     self.client,
                     self.model,
                     **job,
+                )
+                logger.info(
+                    "Memory observer completed: model=%s elapsed_ms=%d",
+                    self.model,
+                    int((time.monotonic() - started) * 1000),
                 )
             except Exception as exc:
                 logger.warning(
@@ -186,3 +195,15 @@ class MemoryObserver:
                 )
             finally:
                 self.queue.task_done()
+
+    def _wait_for_quiet_window(self):
+        if not self._can_process():
+            return False
+        deadline = time.monotonic() + self.delay_seconds
+        while time.monotonic() < deadline:
+            time.sleep(
+                min(self.poll_seconds, max(0.0, deadline - time.monotonic()))
+            )
+            if not self._can_process():
+                return False
+        return True

@@ -2388,6 +2388,7 @@ server_cfg = dotenv_values(
 
 QWEN_API_KEY = credential("dashscope_api_key")
 QWEN_MODEL = (server_cfg.get("CHAT_MODEL") or "qwen-max").strip()
+MEMORY_MODEL = (server_cfg.get("MEMORY_MODEL") or "qwen-plus").strip()
 
 # 联网搜索凭据由 systemd 单独注入，不进仓库。
 TAVILY_API_KEY = credential("tavily_api_key")
@@ -2418,7 +2419,7 @@ if QWEN_API_KEY:
     )
 
 memory_observer = (
-    MemoryObserver(qwen_client, QWEN_MODEL)
+    MemoryObserver(qwen_client, MEMORY_MODEL)
     if qwen_client is not None
     else None
 )

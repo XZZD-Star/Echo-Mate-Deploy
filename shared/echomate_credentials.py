@@ -1,54 +1,7 @@
-import os
-from pathlib import Path
+"""Compatibility alias for :mod:`echomate_core.credentials`."""
 
+import sys
 
-CREDENTIALS_DIR = Path(
-    os.environ.get("CREDENTIALS_DIRECTORY", "")
-).resolve() if os.environ.get("CREDENTIALS_DIRECTORY") else None
+from echomate_core import credentials as _target
 
-
-def credential(name, fallback_env=None):
-    """Read a systemd credential, then fall back to legacy sources."""
-    env_name = fallback_env or name
-    if CREDENTIALS_DIR:
-        path = CREDENTIALS_DIR / name
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            pass
-        else:
-            if value:
-                return value
-
-    if name.startswith("lark_"):
-        legacy_name = "LARK_" + name.removeprefix("lark_").upper()
-    elif name == "tavily_api_key":
-        legacy_name = "TAVILY_API_KEY"
-    else:
-        legacy_name = env_name.upper()
-
-    if name == "dashscope_api_key":
-        legacy_name = "DASHSCOPE_API_KEY"
-
-    value = (os.environ.get(legacy_name) or "").strip()
-    if value:
-        return value
-
-    if name.startswith("lark_"):
-        from dotenv import dotenv_values
-
-        for path in (
-            Path("/root/echomate-deploy/feishu_bot/.env"),
-            Path("/root/echomate-deploy/monitor/.env"),
-        ):
-            if path.is_file():
-                value = (dotenv_values(path).get(legacy_name) or "").strip()
-                if value:
-                    return value
-
-    return (os.environ.get(env_name) or "").strip()
-
-
-def config_value(name):
-    """Read a non-secret setting from the legacy environment."""
-    return (os.environ.get(name) or "").strip()
+sys.modules[__name__] = _target

@@ -1,0 +1,1 @@
+"""Feishu platform entry point."""

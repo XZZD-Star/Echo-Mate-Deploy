@@ -5,7 +5,7 @@ from pathlib import Path
 from contextlib import contextmanager
 import uuid
 
-from sqlite_db import connect as sqlite_connect
+from echomate_core.db import connect as sqlite_connect
 
 
 DB_PATH = Path("/var/lib/echomate/assistant.db")

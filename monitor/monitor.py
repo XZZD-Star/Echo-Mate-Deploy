@@ -10,12 +10,9 @@ from dotenv import load_dotenv
 import os
 import json
 import sys
-from echomate_credentials import credential
-from sqlite_db import connect as sqlite_connect
-
-# 主动播报队列：与 AIChat Server 共用同一份 SQLite。
-sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
-from tools import notify_store
+from echomate_core.credentials import credential
+from echomate_core.db import connect as sqlite_connect
+from echomate_core import notify as notify_store
 
 
 # ================= 配置 =================
@@ -29,7 +26,10 @@ APP_ID = credential("lark_app_id")
 APP_SECRET = credential("lark_app_secret")
 OWNER_OPEN_ID = credential("lark_owner_open_id")
 
-DB_PATH = Path("/var/lib/echomate/assistant.db")
+DB_PATH = Path(
+    os.environ.get("ECHOMATE_DB_PATH", "/var/lib/echomate/assistant.db")
+)
+notify_store.DB_PATH = DB_PATH
 
 # VPS 系统时区是 UTC；所有面向用户的时间统一按北京时间显示。
 LOCAL_TZ = timezone(timedelta(hours=8))
@@ -599,7 +599,7 @@ def monitor_loop():
         time.sleep(max(1, CHECK_INTERVAL - elapsed))
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--test",
@@ -616,3 +616,7 @@ if __name__ == "__main__":
         raise SystemExit(0 if ok else 1)
 
     monitor_loop()
+
+
+if __name__ == "__main__":
+    main()

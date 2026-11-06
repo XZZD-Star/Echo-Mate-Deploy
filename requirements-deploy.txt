@@ -1,0 +1,5 @@
+lark-oapi
+psutil
+python-dotenv
+openai
+requests

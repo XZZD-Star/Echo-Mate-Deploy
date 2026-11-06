@@ -1,0 +1,1 @@
+"""VPS monitor entry point."""

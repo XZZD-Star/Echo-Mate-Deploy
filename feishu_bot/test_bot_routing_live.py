@@ -2,10 +2,10 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from sqlite_db import connect as sqlite_connect
+from echomate_core.db import connect as sqlite_connect
 
 import bot
-import echomate_store
+from echomate_core import store as echomate_store
 
 
 with tempfile.TemporaryDirectory() as temp_dir:

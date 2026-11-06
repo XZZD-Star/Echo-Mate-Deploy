@@ -16,21 +16,23 @@ import lark_oapi as lark
 from dotenv import load_dotenv, dotenv_values
 from urllib.parse import urlparse
 from openai import OpenAI
-from echomate_credentials import credential
-
-# 主动播报队列：与 AIChat Server 共用同一份 SQLite，纯标准库实现。
-sys.path.insert(0, "/root/echomate-deploy/app/Demo/AIChat_demo/Server")
-from tools import notify_store
-from tools import memory_store
-import echomate_store
-import assistant_core
-import assistant_tools
-from memory_observer import MemoryObserver
-from services import assistant_actions
+from echomate_core.credentials import credential
+from echomate_core import actions as assistant_actions
+from echomate_core import assistant as assistant_core
+from echomate_core import memory as memory_store
+from echomate_core import notify as notify_store
+from echomate_core import store as echomate_store
+from echomate_core import tools as assistant_tools
+from echomate_core.observer import MemoryObserver
 from contextvars import ContextVar
-from sqlite_db import connect as sqlite_connect
-from sqlite_db import open_connection
+from echomate_core.schema import init_core_schema
+from echomate_core.db import connect as sqlite_connect
+from echomate_core.db import open_connection
 import agent_runtime
+try:
+    from . import deploy_schema
+except ImportError:
+    import deploy_schema
 import pc_control_service
 import pc_control_store
 import pc_pages
@@ -50,7 +52,9 @@ APP_ID = credential("lark_app_id")
 APP_SECRET = credential("lark_app_secret")
 OWNER_OPEN_ID = credential("lark_owner_open_id")
 
-DB_PATH = Path("/var/lib/echomate/assistant.db")
+DB_PATH = Path(
+    os.environ.get("ECHOMATE_DB_PATH", "/var/lib/echomate/assistant.db")
+)
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 PC_DEVICE_ID = os.environ.get("ECHOMATE_PC_DEVICE_ID", "windows-main")
 PC_PROFILE_ID = os.environ.get("ECHOMATE_PC_PROFILE_ID", "default")
@@ -94,56 +98,7 @@ def format_due_friendly(utc_text):
 # ==================== 数据库 ====================
 
 def init_db():
-    conn = open_connection(DB_PATH)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_memories_owner_id
-                ON memories(owner_id, id);
-
-            CREATE TABLE IF NOT EXISTS processed_events (
-                event_id TEXT PRIMARY KEY,
-                processed_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS todos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                due_at_utc TEXT NOT NULL,
-                timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at_utc TEXT NOT NULL,
-                chat_id TEXT NOT NULL,
-                reminded_at_utc TEXT,
-                last_attempt_at_utc TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_todos_due
-                ON todos(status, due_at_utc, reminded_at_utc);
-        """)
-
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=30)
-        ).isoformat(timespec="seconds")
-
-        conn.execute(
-            "DELETE FROM processed_events WHERE processed_at < ?",
-            (cutoff,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    if DB_PATH.exists():
-        os.chmod(DB_PATH, 0o600)
+    deploy_schema.init_deploy_schema(DB_PATH)
 
 
 # ==================== 记忆与待办命令 ====================
@@ -3659,9 +3614,11 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1):
 # ==================== 启动 ====================
 
 def main():
+    echomate_store.DB_PATH = DB_PATH
+    notify_store.DB_PATH = DB_PATH
     init_db()
     init_chat_table()
-    echomate_store.init_schema()
+    init_core_schema()
     pc_control_store.init_schema()
     pc_control_store.pause_all_active_sessions()
 

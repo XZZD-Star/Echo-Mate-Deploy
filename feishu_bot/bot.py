@@ -87,15 +87,15 @@ from apps.feishu.views.content import (
 )
 from apps.feishu.views.formatting import *
 from apps.feishu.views.formatting import (
-    _clamp_page,
-    _format_bytes,
-    _kind_label,
-    _normalize_hhmm,
-    _page_count,
-    _pager_lines,
-    _pager_state,
-    _unit_dot,
-    _unit_state_text,
+    clamp_page as _clamp_page,
+    format_bytes as _format_bytes,
+    kind_label as _kind_label,
+    normalize_hhmm as _normalize_hhmm,
+    page_count as _page_count,
+    pager_lines as _pager_lines,
+    pager_state as _pager_state,
+    unit_dot as _unit_dot,
+    unit_state_text as _unit_state_text,
 )
 from apps.feishu.worker import reminder_loop
 

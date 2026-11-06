@@ -11,7 +11,8 @@ from .views.content import (
     _build_todo_page,
     render_page,
 )
-from .views.formatting import _clamp_page, _pager_state
+from .views.formatting import clamp_page as _clamp_page
+from .views.formatting import pager_state as _pager_state
 
 def _build_pc_page(conn, chat_id, page, page_index=1):
     if not _pc_control_enabled(conn):

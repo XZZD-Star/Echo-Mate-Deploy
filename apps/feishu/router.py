@@ -22,7 +22,7 @@ from .views.content import (
     render_status_detail,
     render_todo_new,
 )
-from .views.formatting import _normalize_hhmm
+from .views.formatting import normalize_hhmm as _normalize_hhmm
 
 def _toggle(kind_key, target):
     current = notify_store.get_setting(kind_key, "1")

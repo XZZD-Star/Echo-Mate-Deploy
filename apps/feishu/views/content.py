@@ -20,14 +20,14 @@ from ..constants import (
 from ..runtime import DB_PATH, LOCAL_TZ, OWNER_OPEN_ID
 from ..time_utils import now_utc
 from .formatting import (
-    _clamp_page,
-    _format_bytes,
-    _kind_label,
-    _normalize_hhmm,
-    _pager_lines,
-    _pager_state,
-    _unit_dot,
-    _unit_state_text,
+    clamp_page as _clamp_page,
+    format_bytes as _format_bytes,
+    kind_label as _kind_label,
+    normalize_hhmm as _normalize_hhmm,
+    pager_lines as _pager_lines,
+    pager_state as _pager_state,
+    unit_dot as _unit_dot,
+    unit_state_text as _unit_state_text,
 )
 
 def _unit_state(unit):

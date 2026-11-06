@@ -9,7 +9,7 @@ from .page_state import (
     state_nav_stack,
 )
 from .pages import _render_page_state
-from .views.formatting import _page_count
+from .views.formatting import page_count as _page_count
 
 def _enter(conn, chat_id, page, mode="push"):
     current_state = get_page_state(chat_id, conn=conn)

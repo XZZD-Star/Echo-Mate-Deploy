@@ -1,11 +1,14 @@
-"""Low-level Feishu message transport."""
+"""Feishu API transport and business-level message helpers."""
 
 import json
 
 import lark_oapi as lark
 
+from . import config
+from .views import build_page_card
 
-def send_text(api_client, receive_id, text, receive_id_type="chat_id"):
+
+def _send_text_api(api_client, receive_id, text, receive_id_type="chat_id"):
     request = (
         lark.im.v1.CreateMessageRequest.builder()
         .receive_id_type(receive_id_type)
@@ -30,7 +33,7 @@ def send_text(api_client, receive_id, text, receive_id_type="chat_id"):
     return False
 
 
-def send_card(api_client, receive_id, card, receive_id_type="chat_id"):
+def _send_card_api(api_client, receive_id, card, receive_id_type="chat_id"):
     request = (
         lark.im.v1.CreateMessageRequest.builder()
         .receive_id_type(receive_id_type)
@@ -55,4 +58,22 @@ def send_card(api_client, receive_id, card, receive_id_type="chat_id"):
     return False
 
 
-__all__ = ["send_card", "send_text"]
+def send_text(receive_id, text, receive_id_type="chat_id"):
+    return _send_text_api(
+        config.api_client, receive_id, text, receive_id_type
+    )
+
+
+def send_card(receive_id, card, receive_id_type="chat_id"):
+    return _send_card_api(
+        config.api_client, receive_id, card, receive_id_type
+    )
+
+
+def send_page_card(chat_id, page, text):
+    if send_card(chat_id, build_page_card(page, text)):
+        return True
+    return send_text(chat_id, text)
+
+
+__all__ = ["send_card", "send_page_card", "send_text"]

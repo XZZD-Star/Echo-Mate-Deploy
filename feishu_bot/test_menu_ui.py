@@ -61,8 +61,8 @@ class MenuUITest(unittest.TestCase):
         self.assertEqual(card["header"]["template"], "orange")
 
     def test_page_card_falls_back_to_text(self):
-        with patch("apps.feishu.messaging.send_card", return_value=False), patch(
-            "apps.feishu.messaging.send_text",
+        with patch("apps.feishu.transport.send_card", return_value=False), patch(
+            "apps.feishu.transport.send_text",
             return_value=True,
         ) as fallback:
             self.assertTrue(bot.send_page_card("chat", "status", "body"))
@@ -120,7 +120,7 @@ class MenuUITest(unittest.TestCase):
             },
         ]
         with patch(
-            "apps.feishu.views.notify._record_total",
+            "apps.feishu.views._record_total",
             return_value=2,
         ), patch(
             "bot.notify_store.recent_records",

@@ -1,8 +1,4 @@
-"""Stable compatibility entry point for the Feishu application.
-
-The implementation lives under :mod:`apps.feishu`. This module keeps the
-legacy import path and command name used by systemd and existing tests.
-"""
+"""Stable compatibility entry point for the Feishu application."""
 
 import subprocess
 import sys
@@ -29,65 +25,50 @@ from feishu_bot.pc_routing import PC_PAGES
 
 from apps.feishu.ai import *
 from apps.feishu.ai import (
-    _chat_with_tools,
-    _compose_or_fallback,
     _execute_planned_actions,
-    _normalize_memory,
-)
-from apps.feishu.ai_constants import CHAT_TOOLS, READ_ONLY_TOOLS
-from apps.feishu.app import main
-from apps.feishu.constants import *
-from apps.feishu.features.pc import *
-from apps.feishu.features.pc import _handle_pc_context, _pc_event_key, _pc_job_ack
-from apps.feishu.features.todo import *
-from apps.feishu.features.todo import (
-    _add_todo,
-    _handle_todo_action,
-    _parse_natural_todo,
-)
-from apps.feishu.features.tools import (
     _run_tool,
     _tool_add_todo,
+    _tool_get_weather,
     _tool_list_todos,
     _tool_propose_memory,
     _tool_search_memories,
     _tool_web_search,
 )
-from apps.feishu.features.weather import (
-    _extract_place,
-    _fetch_weather,
-    _geocode,
-    _is_weather_question,
-    _memory_places,
-    _tool_get_weather,
-    weather_reply,
+from apps.feishu.app import main, on_message
+from apps.feishu.config import *
+from apps.feishu.features import *
+from apps.feishu.features import (
+    _add_todo,
+    _handle_pc_context,
+    _handle_todo_action,
+    _parse_natural_todo,
+    reminder_loop,
 )
-from apps.feishu.handlers import on_message
-from apps.feishu.messaging import send_card, send_page_card, send_text
 from apps.feishu.navigation import *
 from apps.feishu.navigation import (
+    _build_pc_page,
     _enter,
     _handle_pagination,
     _navigate_back,
     _open_page_index,
+    _render_page_state,
 )
-from apps.feishu.page_state import *
-from apps.feishu.page_state import (
+from apps.feishu.router import *
+from apps.feishu.router import _handle_page_number, _toggle, handle_command
+from apps.feishu.storage import *
+from apps.feishu.storage import (
     _pc_control_enabled,
     _read_setting,
     _write_setting,
     get_page,
     get_page_state,
+    init_chat_table,
+    init_db,
     set_page,
 )
-from apps.feishu.pages import _build_pc_page, _render_page_state
-from apps.feishu.router import *
-from apps.feishu.router import _handle_page_number, _toggle, handle_command
-from apps.feishu.runtime import *
-from apps.feishu.schema import init_chat_table, init_db
-from apps.feishu.time_utils import *
-from apps.feishu.views.content import *
-from apps.feishu.views.content import (
+from apps.feishu.transport import send_card, send_page_card, send_text
+from apps.feishu.views import *
+from apps.feishu.views import (
     _build_chat_memory_page,
     _build_memory_page,
     _build_records_page,
@@ -95,20 +76,16 @@ from apps.feishu.views.content import (
     _build_todo_page,
     _memory_candidate_display_index,
     _record_total,
+    _clamp_page,
+    _format_bytes,
+    _kind_label,
+    _normalize_hhmm,
+    _page_count,
+    _pager_lines,
+    _pager_state,
+    _unit_dot,
+    _unit_state_text,
 )
-from apps.feishu.views.formatting import *
-from apps.feishu.views.formatting import (
-    clamp_page as _clamp_page,
-    format_bytes as _format_bytes,
-    kind_label as _kind_label,
-    normalize_hhmm as _normalize_hhmm,
-    page_count as _page_count,
-    pager_lines as _pager_lines,
-    pager_state as _pager_state,
-    unit_dot as _unit_dot,
-    unit_state_text as _unit_state_text,
-)
-from apps.feishu.worker import reminder_loop
 
 
 if __name__ == "__main__":

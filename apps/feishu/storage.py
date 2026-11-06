@@ -1,13 +1,83 @@
+"""SQLite schema, page state and navigation persistence."""
+
 import json
+import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from echomate_core import notify as notify_store
+from echomate_core.db import open_connection
 from feishu_bot import pc_control_store
 
-from .constants import PAGE_PARENT, PAGED_PAGE_SIZES, PAGES, PAGE_TTL_SECONDS
-from .runtime import OWNER_OPEN_ID
-from .time_utils import now_utc
+from .config import (
+    DB_PATH,
+    OWNER_OPEN_ID,
+    PAGED_PAGE_SIZES,
+    PAGE_PARENT,
+    PAGES,
+    PAGE_TTL_SECONDS,
+    now_utc,
+)
+
+
+def init_deploy_schema(db_path):
+    """Create Feishu event-deduplication tables."""
+    db_path = Path(db_path)
+    conn = open_connection(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS processed_events (
+                event_id TEXT PRIMARY KEY,
+                processed_at TEXT NOT NULL
+            );
+            """
+        )
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat(timespec="seconds")
+        conn.execute(
+            "DELETE FROM processed_events WHERE processed_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if db_path.exists():
+        os.chmod(db_path, 0o600)
+
+
+def init_db():
+    init_deploy_schema(DB_PATH)
+
+
+def init_chat_table():
+    """建立独立聊天历史表，不修改已有记忆和待办数据。"""
+    conn = open_connection(DB_PATH)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL
+                    CHECK(role IN ('user', 'assistant')),
+                content TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_lookup
+                ON chat_messages(owner_id, chat_id, id);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    os.chmod(DB_PATH, 0o600)
+
 
 def default_nav_stack(page):
     if page == "menu":

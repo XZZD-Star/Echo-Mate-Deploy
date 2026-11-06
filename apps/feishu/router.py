@@ -1,3 +1,5 @@
+"""Command and page routing for the Feishu bot."""
+
 import re
 from datetime import datetime
 
@@ -5,24 +7,18 @@ from echomate_core import notify as notify_store
 from echomate_core import store as echomate_store
 from feishu_bot.pc_routing import PC_PAGES
 
-from .constants import PAGE_UNKNOWN_HINT
-from .features.pc import _handle_pc_context
-from .features.todo import _add_todo, _handle_todo_action, _parse_natural_todo
+from .config import LOCAL_TZ, OWNER_OPEN_ID, PAGE_UNKNOWN_HINT
+from .features import _add_todo, _handle_pc_context, _handle_todo_action, _parse_natural_todo
 from .navigation import _enter, _handle_pagination, _navigate_back
-from .page_state import (
-    _pc_control_enabled,
-    get_page,
-    get_page_state,
-    set_page,
-)
-from .runtime import LOCAL_TZ, OWNER_OPEN_ID
-from .views.content import (
+from .storage import _pc_control_enabled, get_page, get_page_state, set_page
+from .views import (
     _memory_candidate_display_index,
+    normalize_hhmm as _normalize_hhmm,
     render_status,
     render_status_detail,
     render_todo_new,
 )
-from .views.formatting import normalize_hhmm as _normalize_hhmm
+
 
 def _toggle(kind_key, target):
     current = notify_store.get_setting(kind_key, "1")

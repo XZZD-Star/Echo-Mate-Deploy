@@ -6,11 +6,21 @@ from echomate_core.db import connect as sqlite_connect
 
 import bot
 from echomate_core import store as echomate_store
+from apps.feishu import ai as feishu_ai
+from apps.feishu import runtime as feishu_runtime
+from apps.feishu import schema as feishu_schema
+from apps.feishu.views import content as feishu_content
 
 
 with tempfile.TemporaryDirectory() as temp_dir:
     db_path = Path(temp_dir) / "assistant.db"
-    bot.DB_PATH = db_path
+    for module in (
+        feishu_runtime,
+        feishu_schema,
+        feishu_ai,
+        feishu_content,
+    ):
+        module.DB_PATH = db_path
     echomate_store.DB_PATH = db_path
     bot.pc_control_store.DB_PATH = db_path
 

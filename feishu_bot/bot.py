@@ -16,6 +16,11 @@ import lark_oapi as lark
 from dotenv import load_dotenv, dotenv_values
 from urllib.parse import urlparse
 from openai import OpenAI
+
+DEPLOY_ROOT = Path(__file__).resolve().parents[1]
+if str(DEPLOY_ROOT) not in sys.path:
+    sys.path.insert(0, str(DEPLOY_ROOT))
+
 from echomate_core.credentials import credential
 from echomate_core import actions as assistant_actions
 from echomate_core import assistant as assistant_core
@@ -37,6 +42,17 @@ import pc_control_service
 import pc_control_store
 import pc_pages
 from pc_routing import PC_PAGES
+from apps.feishu.views.formatting import (
+    clamp_page as _clamp_page,
+    format_bytes as _format_bytes,
+    kind_label as _kind_label,
+    normalize_hhmm as _normalize_hhmm,
+    page_count as _page_count,
+    pager_lines as _pager_lines,
+    pager_state as _pager_state,
+    unit_dot as _unit_dot,
+    unit_state_text as _unit_state_text,
+)
 
 CURRENT_CHAT_ID = ContextVar("CURRENT_CHAT_ID", default="")
 
@@ -283,36 +299,6 @@ def page_key(chat_id):
     return f"menu:{chat_id}"
 
 
-def _page_count(total, page_size):
-    return max(1, (max(0, total) + page_size - 1) // page_size)
-
-
-def _clamp_page(page_index, total, page_size):
-    index = max(1, int(page_index or 1))
-    return min(index, _page_count(total, page_size))
-
-
-def _pager_lines(page_index, total, page_size, extra=None):
-    pages = _page_count(total, page_size)
-    lines = []
-    if extra:
-        lines.append(extra)
-    lines.extend([
-        f"第 {page_index}/{pages} 页 · 共 {total} 条",
-        "8 上一页 · 9 下一页 · 0 返回",
-    ])
-    return lines
-
-
-def _pager_state(page_index, total, page_size, item_ids):
-    return {
-        "page_index": page_index,
-        "page_size": page_size,
-        "total": total,
-        "item_ids": item_ids,
-    }
-
-
 def _read_setting(conn, key, default=""):
     """优先用调用方连接读，读不到再回退到 notify_store。"""
     if conn is not None:
@@ -435,25 +421,6 @@ def _unit_state(unit):
         return (proc.stdout or "").strip() or "unknown"
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
-
-
-def _unit_state_text(state):
-    if state == "active":
-        return "正常"
-    if state in {"inactive", "failed", "unknown"}:
-        return "异常"
-    return state
-
-
-def _unit_dot(state):
-    return "🟢" if state == "active" else "🔴"
-
-
-def _format_bytes(value):
-    gib = value / 1024**3
-    if gib >= 1:
-        return f"{gib:.1f} GB".replace(".0 GB", " GB")
-    return f"{value / 1024**2:.0f} MB"
 
 
 def _service_states():
@@ -1205,30 +1172,6 @@ def render_page(conn, chat_id, page, page_index=1):
             "取消发：0"
         )
     return menu_text()
-
-
-def _normalize_hhmm(value):
-    """把 9:05 这类写法规范成 09:05，非法返回 None。"""
-    try:
-        hour, minute = value.split(":", 1)
-        hour = int(hour)
-        minute = int(minute)
-    except (TypeError, ValueError):
-        return None
-
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-
-    return f"{hour:02d}:{minute:02d}"
-
-
-def _kind_label(kind):
-    return {
-        "todo": "待办",
-        "alert": "告警",
-        "recovery": "恢复",
-        "manual": "测试",
-    }.get(kind, kind)
 
 
 def _build_pc_page(conn, chat_id, page, page_index=1):

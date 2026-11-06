@@ -120,7 +120,7 @@ class MenuUITest(unittest.TestCase):
             },
         ]
         with patch(
-            "apps.feishu.views.content._record_total",
+            "apps.feishu.views.notify._record_total",
             return_value=2,
         ), patch(
             "bot.notify_store.recent_records",

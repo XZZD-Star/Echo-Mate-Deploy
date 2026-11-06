@@ -33,14 +33,8 @@ from apps.feishu.ai import (
     _compose_or_fallback,
     _execute_planned_actions,
     _normalize_memory,
-    _run_tool,
-    _tool_add_todo,
-    _tool_get_weather,
-    _tool_list_todos,
-    _tool_propose_memory,
-    _tool_search_memories,
-    _tool_web_search,
 )
+from apps.feishu.ai_constants import CHAT_TOOLS, READ_ONLY_TOOLS
 from apps.feishu.app import main
 from apps.feishu.constants import *
 from apps.feishu.features.pc import *
@@ -50,6 +44,23 @@ from apps.feishu.features.todo import (
     _add_todo,
     _handle_todo_action,
     _parse_natural_todo,
+)
+from apps.feishu.features.tools import (
+    _run_tool,
+    _tool_add_todo,
+    _tool_list_todos,
+    _tool_propose_memory,
+    _tool_search_memories,
+    _tool_web_search,
+)
+from apps.feishu.features.weather import (
+    _extract_place,
+    _fetch_weather,
+    _geocode,
+    _is_weather_question,
+    _memory_places,
+    _tool_get_weather,
+    weather_reply,
 )
 from apps.feishu.handlers import on_message
 from apps.feishu.messaging import send_card, send_page_card, send_text
